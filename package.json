@@ -1,12 +1,12 @@
 {
-  "name": "zeplao-bot-boco",
+  "name": "zeplao-bot-math",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Bot tra giá chứng khoán cho Cúc Cu — gõ /vic, /hpg trong nhóm",
+  "description": "Bot tính toán trong nhóm chat — gõ !calc 1 + 1",
   "scripts": {
-    "start": "node bocobot.mjs",
-    "test": "node --test --test-concurrency=1 bocobot.test.mjs market.test.mjs"
+    "start": "node mathbot.mjs",
+    "test": "node --test --test-concurrency=1 mathbot.test.mjs"
   },
   "engines": {
     "node": ">=18"
