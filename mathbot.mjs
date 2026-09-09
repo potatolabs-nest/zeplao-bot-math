@@ -176,11 +176,13 @@ export async function run(token, { signal, api = API, statePath = STATE } = {}) 
   async function say(conversationId, text, replyToMessageId) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        return await call('sendMessage', { conversationId, text, replyToMessageId });
+        const result = await call('sendMessage', { conversationId, text, replyToMessageId });
+        console.log(`    -> đã gửi vào ${conversationId}`);
+        return result;
       } catch (problem) {
         const msg = String(problem);
         if (!msg.includes('429') || attempt === 2) {
-          console.error(`    sendMessage thất bại: trong=${conversationId} | ${msg}`);
+          console.error(`    -> gửi thất bại vào ${conversationId}: ${msg}`);
           return null;
         }
         await wait(1100 * (attempt + 1));
