@@ -3,10 +3,8 @@ import { setTimeout as wait } from 'node:timers/promises';
 
 export const API = process.env.ZEPLAO_BOT_API ?? 'https://api-bot.kuku.vn';
 
-export const CALL = '!';
-
 export const SORRY = {
-  calc: 'Không tính được. Hãy thử lại một biểu thức đơn giản như `!calc 1 + 1`.',
+  calc: 'Không tính được. Hãy thử lại một biểu thức đơn giản như `@mathnewbot 1 + 1`.',
 };
 
 function formatResult(result) {
@@ -19,7 +17,9 @@ export function safeCalc(input) {
   const tokens = [];
   const regex = /(\d+(?:\.\d+)?)|([+\-*/()])|\s+/g;
   let match;
-  while ((match = regex.exec(String(input ?? '')))) {
+  for (;;) {
+    match = regex.exec(String(input ?? ''));
+    if (!match) break;
     if (match[1] !== undefined) {
       tokens.push({ type: 'num', value: Number(match[1]) });
     } else if (match[2] !== undefined) {
@@ -78,24 +78,21 @@ export function safeCalc(input) {
   return result;
 }
 
-export function askedCalcFor(message) {
-  const text = String(message?.text ?? '').trimStart();
-  if (!text.startsWith(CALL)) return null;
+export function askedCalcFor(message, me) {
+  if (!message) return null;
 
-  const asked = text.slice(CALL.length).trimStart();
+  const text = message.text ?? '';
+  const handles = [me?.username, me?.displayName].filter(Boolean);
+  const mentioned = handles.some((h) => text.toLowerCase().includes(`@${h.toLowerCase()}`));
+  if (!mentioned) return null;
 
-  const command = (message.command ?? '').toLowerCase();
-  if (command === 'calc' || command === 'tinh') {
-    return { expression: String(message.commandArgs ?? '').trim() };
+  let asked = text;
+  for (const handle of handles) {
+    asked = asked.replace(new RegExp(`@${handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`, 'gi'), ' ');
   }
+  asked = asked.replace(/@\S+/g, ' ').trim();
 
-  if (/^calc(\s|$)/i.test(asked)) {
-    return { expression: asked.replace(/^calc\b/i, '').trim() };
-  }
-  if (/^tinh(\s|$)/i.test(asked)) {
-    return { expression: asked.replace(/^tinh\b/i, '').trim() };
-  }
-  return null;
+  return { expression: asked };
 }
 
 export async function run(token, { signal, api = API } = {}) {
@@ -117,16 +114,12 @@ export async function run(token, { signal, api = API } = {}) {
   const me = await call('getMe');
   console.log(`@${me.username} đang trực`);
 
-  await call('setCommands', { commands: [] }).catch(() => {});
-
-  let offset = 0;
-
   for (;;) {
     if (signal?.aborted) break;
 
     let updates;
     try {
-      updates = await call(`getUpdates?offset=${offset}&timeout=30`);
+      updates = await call('getUpdates?timeout=30');
     } catch (problem) {
       if (signal?.aborted) break;
       console.error(String(problem));
@@ -135,8 +128,6 @@ export async function run(token, { signal, api = API } = {}) {
     }
 
     for (const update of updates) {
-      offset = update.id + 1;
-
       try {
         if (update.kind === 'message') await onMessage(update.message);
       } catch (problem) {
@@ -146,7 +137,7 @@ export async function run(token, { signal, api = API } = {}) {
   }
 
   async function onMessage(message) {
-    const calcAsked = askedCalcFor(message);
+    const calcAsked = askedCalcFor(message, me);
     if (!calcAsked) return;
 
     if (!calcAsked.expression) {

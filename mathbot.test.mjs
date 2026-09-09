@@ -5,6 +5,9 @@ import { setTimeout as wait } from 'node:timers/promises';
 
 import { askedCalcFor, safeCalc, run, SORRY } from './mathbot.mjs';
 
+const ME = { username: 'mathnewbot', displayName: 'Math New Bot' };
+const msg = (fields) => ({ conversationId: 'p1', conversationType: 'group', messageId: 'm1', ...fields });
+
 // ---- safeCalc --------------------------------------------------------------------------------
 
 test('1 + 1 = 2', () => assert.equal(safeCalc('1 + 1'), 2));
@@ -21,23 +24,17 @@ test('không phải số', () => assert.ok(Number.isNaN(safeCalc('abc'))));
 
 // ---- askedCalcFor -----------------------------------------------------------------------------
 
-test('!calc 1 + 1 là lệnh tính toán', () => {
-  const result = askedCalcFor({ text: '!calc 1 + 1' });
-  assert.deepEqual(result, { expression: '1 + 1' });
+test('@mathnewbot 1 + 1 là lệnh tính toán', () => {
+  assert.deepEqual(askedCalcFor(msg({ text: '@mathnewbot 1 + 1' }), ME), { expression: '1 + 1' });
 });
 
-test('!tinh 2 * 3 là lệnh tính toán', () => {
-  const result = askedCalcFor({ text: '!tinh 2 * 3' });
-  assert.deepEqual(result, { expression: '2 * 3' });
+test('@Math New Bot 2 * 3 dùng tên hiển thị', () => {
+  assert.deepEqual(askedCalcFor(msg({ text: '@Math New Bot 2 * 3' }), ME), { expression: '2 * 3' });
 });
 
-test('!calc không có biểu thức', () => {
-  const result = askedCalcFor({ text: '!calc' });
-  assert.deepEqual(result, { expression: '' });
-});
-
-test('không có dấu gọi thì không phải lệnh', () => assert.equal(askedCalcFor({ text: 'calc 1+1' }), null));
-test('null message', () => assert.equal(askedCalcFor(null), null));
+test('nhóm không có @ thì im', () => assert.equal(askedCalcFor(msg({ text: '1 + 1' }), ME), null));
+test('nhắn riêng cũng im', () => assert.equal(askedCalcFor(msg({ conversationType: 'direct', text: '1 + 1' }), ME), null));
+test('null message', () => assert.equal(askedCalcFor(null, ME), null));
 
 // ---- cho nó chạy thật ------------------------------------------------------------------------
 
@@ -55,8 +52,7 @@ async function stubApi(updates) {
         response.end(JSON.stringify(value));
       };
 
-      if (path === '/getMe') return answer({ username: 'mathbot', displayName: 'Math Bot' });
-      if (path === '/setCommands') return answer({ ok: true });
+      if (path === '/getMe') return answer(ME);
       if (path === '/sendMessage') {
         sent.push(JSON.parse(body));
         return answer({ messageId: `m${sent.length}` });
@@ -98,35 +94,35 @@ async function withBot(updates, { expect = 1, settle = 200 } = {}) {
   return platform;
 }
 
-const update = (fields, id = 1) => ({ id, kind: 'message', message: { conversationId: 'p1', conversationType: 'group', messageId: 'm1', ...fields } });
+const update = (fields, id = 1) => ({ id, kind: 'message', message: msg(fields) });
 
-test('!calc 1 + 1 trả về 2', async () => {
-  const { sent } = await withBot([update({ text: '!calc 1 + 1' })]);
+test('@mathnewbot 1 + 1 trả về 2', async () => {
+  const { sent } = await withBot([update({ text: '@mathnewbot 1 + 1' })]);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].text, '2');
 });
 
-test('!calc 2 * (3 + 4) trả về 14', async () => {
-  const { sent } = await withBot([update({ text: '!calc 2 * (3 + 4)' })]);
+test('@mathnewbot 2 * (3 + 4) trả về 14', async () => {
+  const { sent } = await withBot([update({ text: '@mathnewbot 2 * (3 + 4)' })]);
   assert.equal(sent[0].text, '14');
 });
 
-test('!tinh 100 / 3 có thập phân', async () => {
-  const { sent } = await withBot([update({ text: '!tinh 100 / 3' })]);
+test('@mathnewbot 100 / 3 có thập phân', async () => {
+  const { sent } = await withBot([update({ text: '@mathnewbot 100 / 3' })]);
   assert.match(sent[0].text, /^33\.3333333333$/);
 });
 
 test('biểu thức sai thì báo lỗi', async () => {
-  const { sent } = await withBot([update({ text: '!calc abc' })]);
+  const { sent } = await withBot([update({ text: '@mathnewbot abc' })]);
   assert.equal(sent[0].text, SORRY.calc);
 });
 
-test('!calc không có biểu thức thì báo lỗi', async () => {
-  const { sent } = await withBot([update({ text: '!calc' })]);
+test('@mathnewbot không có biểu thức thì báo lỗi', async () => {
+  const { sent } = await withBot([update({ text: '@mathnewbot' })]);
   assert.equal(sent[0].text, SORRY.calc);
 });
 
-test('tin nhắn không có dấu gọi thì bot im', async () => {
+test('nhóm không mention thì im', async () => {
   const { sent } = await withBot([update({ text: '1 + 1' })], { expect: 0 });
   assert.deepEqual(sent, []);
 });
