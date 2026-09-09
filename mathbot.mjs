@@ -1,7 +1,12 @@
+import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as wait } from 'node:timers/promises';
 
 export const API = process.env.ZEPLAO_BOT_API ?? 'https://api-bot.kuku.vn';
+
+export const STATE = process.env.MATHBOT_STATE
+  ?? fileURLToPath(new URL('./data/state.json', import.meta.url));
 
 export const SORRY = {
   calc: 'Không tính được. Hãy thử lại một biểu thức đơn giản như `@mathnewbot 1 + 1`.',
@@ -95,7 +100,7 @@ export function askedCalcFor(message, me) {
   return { expression: asked };
 }
 
-export async function run(token, { signal, api = API } = {}) {
+export async function run(token, { signal, api = API, statePath = STATE } = {}) {
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
   async function call(method, body) {
@@ -114,12 +119,16 @@ export async function run(token, { signal, api = API } = {}) {
   const me = await call('getMe');
   console.log(`@${me.username} đang trực`);
 
+  const state = loadState(statePath);
+  let offset = Number(state.offset) || 0;
+  if (offset) console.log(`đọc tiếp từ cập nhật ${offset}`);
+
   for (;;) {
     if (signal?.aborted) break;
 
     let updates;
     try {
-      updates = await call('getUpdates?timeout=30');
+      updates = await call(`getUpdates?offset=${offset}&timeout=30`);
     } catch (problem) {
       if (signal?.aborted) break;
       console.error(String(problem));
@@ -128,6 +137,9 @@ export async function run(token, { signal, api = API } = {}) {
     }
 
     for (const update of updates) {
+      offset = update.id;
+      saveState(statePath, { offset });
+
       try {
         if (update.kind === 'message') await onMessage(update.message);
       } catch (problem) {
@@ -163,6 +175,24 @@ export async function run(token, { signal, api = API } = {}) {
       }
     }
     return null;
+  }
+}
+
+function loadState(path) {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch {
+    return { offset: 0 };
+  }
+}
+
+function saveState(path, state) {
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(`${path}.tmp`, JSON.stringify(state));
+    renameSync(`${path}.tmp`, path);
+  } catch (problem) {
+    console.error(`không ghi được trạng thái: ${problem}`);
   }
 }
 

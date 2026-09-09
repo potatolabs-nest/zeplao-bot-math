@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { setTimeout as wait } from 'node:timers/promises';
 
 import { askedCalcFor, safeCalc, run, SORRY } from './mathbot.mjs';
@@ -78,10 +81,12 @@ async function stubApi(updates) {
 async function withBot(updates, { expect = 1, settle = 200 } = {}) {
   const platform = await stubApi(updates);
   const stopping = new AbortController();
+  const statePath = join(tmpdir(), `math-${randomUUID()}.json`);
 
   const loop = run('token', {
     signal: stopping.signal,
     api: platform.api,
+    statePath,
   });
 
   const deadline = Date.now() + 5000;
