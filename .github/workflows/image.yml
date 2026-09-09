@@ -16,7 +16,7 @@ concurrency:
 
 env:
   REGISTRY: git.potatolabs.uk
-  IMAGE_NAME: zeplao/zeplao-bot-boco
+  IMAGE_NAME: zeplao/zeplao-bot-math
   CONTAINER_HOST: unix:///var/run/docker.sock
 
 jobs:
@@ -99,10 +99,10 @@ jobs:
         env:
           IMAGE_TAG: sha-${{ forgejo.sha }}
         run: |
-          manifest="gitops/apps/zeplao-bot-boco/resources/deployment.yaml"
+          manifest="gitops/apps/zeplao-bot-math/resources/deployment.yaml"
 
           sed -i -E \
-            "s#(image: git\.potatolabs\.uk/zeplao/zeplao-bot-boco:).*#\1${IMAGE_TAG}#" \
+            "s#(image: git\.potatolabs\.uk/zeplao/zeplao-bot-math:).*#\1${IMAGE_TAG}#" \
             "$manifest"
 
           if git diff --quiet -- "$manifest"; then
@@ -114,6 +114,6 @@ jobs:
           git config user.email "deploy-bot@potatolabs.uk"
 
           git add "$manifest"
-          git commit -m "deploy(zeplao-bot-boco): ${IMAGE_TAG}"
+          git commit -m "deploy(zeplao-bot-math): ${IMAGE_TAG}"
           git push origin HEAD:main
 
