@@ -117,11 +117,9 @@ export async function run(token, { signal, api = API, statePath = STATE } = {}) 
   }
 
   const me = await call('getMe');
-  console.log(`@${me.username} đang trực`);
-
   const state = loadState(statePath);
   let offset = Number(state.offset) || 0;
-  if (offset) console.log(`đọc tiếp từ cập nhật ${offset}`);
+  console.log(`@${me.username} đang trực | offset=${offset}`);
 
   for (;;) {
     if (signal?.aborted) break;
@@ -136,12 +134,23 @@ export async function run(token, { signal, api = API, statePath = STATE } = {}) 
       continue;
     }
 
+    if (updates.length) console.log(`nhận ${updates.length} cập nhật, offset hiện tại=${offset}`);
+
     for (const update of updates) {
       offset = update.id;
       saveState(statePath, { offset });
 
       try {
-        if (update.kind === 'message') await onMessage(update.message);
+        if (update.kind === 'message') {
+          const m = update.message;
+          const mentioned = [me.username, me.displayName].some((h) => (m.text ?? '').toLowerCase().includes(`@${h.toLowerCase()}`));
+          console.log(`  [${update.id}] từ=${m.from?.username ?? '?'} trong=${m.conversationId} text="${(m.text ?? '').slice(0, 80)}"`);
+          if (!mentioned) {
+            console.log(`    -> bỏ qua (không mention)`);
+            continue;
+          }
+          await onMessage(m);
+        }
       } catch (problem) {
         console.error(String(problem));
       }
@@ -153,12 +162,14 @@ export async function run(token, { signal, api = API, statePath = STATE } = {}) 
     if (!calcAsked) return;
 
     if (!calcAsked.expression) {
+      console.log(`    -> @${me.username} nhưng không có biểu thức`);
       await say(message.conversationId, SORRY.calc, message.messageId);
       return;
     }
 
     const result = safeCalc(calcAsked.expression);
     const answer = Number.isNaN(result) ? SORRY.calc : formatResult(result);
+    console.log(`    -> "${calcAsked.expression}" = ${answer}`);
     await say(message.conversationId, answer, message.messageId);
   }
 
@@ -167,8 +178,9 @@ export async function run(token, { signal, api = API, statePath = STATE } = {}) 
       try {
         return await call('sendMessage', { conversationId, text, replyToMessageId });
       } catch (problem) {
-        if (!String(problem).includes('429') || attempt === 2) {
-          console.error(String(problem));
+        const msg = String(problem);
+        if (!msg.includes('429') || attempt === 2) {
+          console.error(`    sendMessage thất bại: trong=${conversationId} | ${msg}`);
           return null;
         }
         await wait(1100 * (attempt + 1));
