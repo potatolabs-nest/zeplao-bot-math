@@ -1,12 +1,12 @@
 # mathbot
 
-A math calculator bot for group chat. Mention `@mathnewbot` with an expression and it replies with the result.
+A math calculator bot for group chat. Mention `@mathtanbot` with an expression and it replies with the result.
 
 ```
-@mathnewbot 1 + 1
+@mathtanbot 1 + 1
 → 2
 
-@mathnewbot 2 * (3 + 4)
+@mathtanbot 2 * (3 + 4)
 → 14
 ```
 
@@ -14,11 +14,11 @@ A math calculator bot for group chat. Mention `@mathnewbot` with an expression a
 
 | Gõ | Được gì |
 | --- | --- |
-| `@mathnewbot 1 + 1` | Tính toán và trả kết quả |
-| `@mathnewbot 2 * (3 + 4)` | Hỗ trợ ngoặc, `+`, `-`, `*`, `/` |
-| `@mathnewbot 1.5 + 2.5` | Số thập phân |
+| `@mathtanbot 1 + 1` | Tính toán và trả kết quả |
+| `@mathtanbot 2 * (3 + 4)` | Hỗ trợ ngoặc, `+`, `-`, `*`, `/` |
+| `@mathtanbot 1.5 + 2.5` | Số thập phân |
 
-Bot chỉ phản hồi khi được **mention** (`@mathnewbot`). Tin nhắn không mention sẽ bị bỏ qua.
+Bot chỉ phản hồi khi được **mention** (`@mathtanbot`). Tin nhắn không mention sẽ bị bỏ qua.
 
 ## Chạy
 
@@ -28,7 +28,7 @@ Tạo bot ở [kuku.vn/bot](https://kuku.vn/bot), lấy token, rồi:
 ZEPLAO_BOT_TOKEN=<token> npm start
 ```
 
-Lên đúng thì nó in `@mathnewbot đang trực`. Bất cứ gì khác là token sai.
+Lên đúng thì nó in `@mathtanbot đang trực`. Bất cứ gì khác là token sai.
 
 ### Bằng image
 
