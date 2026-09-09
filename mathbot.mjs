@@ -150,6 +150,8 @@ export async function run(token, { signal, api = API, statePath = STATE } = {}) 
             continue;
           }
           await onMessage(m);
+        } else {
+          console.log(`  [${update.id}] ${update.kind} trong=${update.membership?.conversationId ?? '?'}`);
         }
       } catch (problem) {
         console.error(String(problem));
