@@ -6,6 +6,7 @@ import { setTimeout as wait } from 'node:timers/promises';
 export const API = process.env.ZEPLAO_BOT_API ?? 'https://api-bot.kuku.vn';
 export const STATE = process.env.MATHBOT_STATE
   ?? fileURLToPath(new URL('./data/state.json', import.meta.url));
+export const AUTHOR = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxx';
 
 const ROASTS = [
   'Biểu thức gì đây? Có mắt không? Nhập lại cho đàng hoàng.',
@@ -324,6 +325,143 @@ export function safeCalc(input) {
   return result;
 }
 
+// ---- stock market helpers (trần/sàn) --------------------------------------------------------
+
+const EXCHANGE_LIMITS = {
+  hose: 0.07,  // HOSE: 7%
+  hnx: 0.10,   // HNX: 10%
+  upcom: 0.15, // UPCOM: 15%
+};
+
+const EXCHANGE_NAMES = {
+  hose: 'HOSE (7%)',
+  hnx: 'HNX (10%)',
+  upcom: 'UPCOM (15%)',
+};
+
+// ---- price lookup (from boco) ----------------------------------------------------------------
+
+const FEED = process.env.BOCO_FEED ?? 'https://bgapidatafeed.vps.com.vn';
+const TIMEOUT_MS = 8000;
+
+export async function fetchPrice(symbol, { feed = FEED, fetchImpl = fetch } = {}) {
+  const url = `${feed}/getliststockdata/${symbol.toUpperCase()}`;
+  const response = await fetchImpl(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  if (!response.ok) return null;
+  const data = await response.json();
+  if (!Array.isArray(data) || !data[0]) return null;
+  const raw = data[0];
+  const price = Number(raw.lastPrice) || 0;
+  const reference = Number(raw.r) || 0;
+  return {
+    symbol: raw.sym,
+    price: price > 0 ? price : reference,  // dùng tham chiếu nếu chưa khớp
+    reference,
+    traded: price > 0,
+  };
+}
+
+/**
+ * Parse lệnh kiểu: <mã> tran|san <giá_mục_tiêu> [sàn]
+ * Ví dụ: pom tran 7, pnj san 20, vic tran 50 upcom
+ */
+export function parseStockLookup(text) {
+  const trimmed = text.trim().toLowerCase();
+  // Remove @bot prefix if present
+  const withoutMention = trimmed.replace(/^@\S+\s+/, '').trim();
+
+  // Pattern: <mã> vebo|dallas <giá_mục_tiêu> [sàn]
+  const match = withoutMention.match(/^([a-z0-9]+)\s+(vebo|dallas)\s+(\d+(?:\.\d+)?)\s*(hose|hnx|upcom)?$/);
+  if (!match) return null;
+
+  return {
+    symbol: match[1].toUpperCase(),
+    isCeiling: match[2] === 'vebo',
+    targetPrice: parseFloat(match[3]),
+    exchange: match[4] || 'hose',
+  };
+}
+
+/**
+ * Tính số phiên trần để đạt giá mục tiêu (vebo)
+ */
+export function calcCeilingSessions(entryPrice, targetPrice, exchange = 'hose') {
+  const limit = EXCHANGE_LIMITS[exchange.toLowerCase()] ?? EXCHANGE_LIMITS.hose;
+  if (entryPrice <= 0 || targetPrice <= entryPrice) {
+    return { sessions: 0, finalPrice: entryPrice, exchange, limit };
+  }
+  let price = entryPrice;
+  let sessions = 0;
+  while (price < targetPrice) {
+    price = Math.round(price * (1 + limit) * 100) / 100;
+    sessions++;
+    if (sessions > 1000) break;
+  }
+  return { sessions, finalPrice: price, exchange, limit };
+}
+
+/**
+ * Tính số phiên sàn để đạt giá mục tiêu
+ */
+export function calcFloorSessions(entryPrice, targetPrice, exchange = 'hose') {
+  const limit = EXCHANGE_LIMITS[exchange.toLowerCase()] ?? EXCHANGE_LIMITS.hose;
+  if (entryPrice <= 0 || targetPrice >= entryPrice) {
+    return { sessions: 0, finalPrice: entryPrice, exchange, limit };
+  }
+  let price = entryPrice;
+  let sessions = 0;
+  while (price > targetPrice) {
+    price = Math.round(price * (1 - limit) * 100) / 100;
+    sessions++;
+    if (sessions > 1000) break;
+  }
+  return { sessions, finalPrice: price, exchange, limit };
+}
+
+function formatStockResult(symbol, currentPrice, result, isCeiling) {
+  const { sessions, finalPrice, exchange, limit } = result;
+  const exchangeName = EXCHANGE_NAMES[exchange.toLowerCase()] ?? exchange.toUpperCase();
+  const action = isCeiling ? 'vebo' : 'dallas';
+  const arrow = isCeiling ? '↑' : '↓';
+
+  if (sessions === 0) {
+    return `${symbol} ${fmt(currentPrice)} — không cần phiên ${action} nào. Giá mục tiêu đã đạt.`;
+  }
+
+  return `${symbol} ${fmt(currentPrice)} → ${sessions} phiên ${action} ${exchangeName}
+${arrow} Giá cuối: ${fmt(finalPrice)}`;
+}
+
+// ---- help -------------------------------------------------------------------------------------
+
+const HELP_TEXT = `Cú pháp tính toán:
+@mathtanbot <biểu thức> — ví dụ: @mathtanbot 2 + 3 * 4
+
+Cú pháp tính phiên vebo/dallas (tự động lấy giá hiện tại):
+@mathtanbot <mã> vebo <giá_mục_tiêu> [sàn]
+@mathtanbot <mã> dallas <giá_mục_tiêu> [sàn]
+
+Sàn giao dịch (mặc định: hose):
+• hose — HOSE (7%)
+• hnx — HNX (10%)
+• upcom — UPCOM (15%)
+
+Ví dụ:
+@mathtanbot pom vebo 7 — POM cần bao nhiêu phiên vebo để đạt giá 7
+@mathtanbot pnj dallas 20 — PNJ cần bao nhiêu phiên dallas để về giá 20
+@mathtanbot vic vebo 50 upcom — VIC vebo trên UPCOM (15%)`;
+
+export function askedHelpFor(message, me) {
+  if (!message) return null;
+  const text = (message.text ?? '').toLowerCase();
+  const handles = [me?.username, me?.displayName].filter(Boolean);
+  const mentioned = handles.some((h) => text.includes(`@${h.toLowerCase()}`));
+  if (!mentioned) return null;
+  return text.includes('help') ? { addressed: true } : null;
+}
+
+// ---- askedCalcFor -----------------------------------------------------------------------------
+
 export function askedCalcFor(message, me) {
   if (!message) return null;
   const text = message.text ?? '';
@@ -340,7 +478,13 @@ export function askedCalcFor(message, me) {
 
 // ---- bot loop ---------------------------------------------------------------------------------
 
-export async function run(token, { signal, api = API, statePath = STATE } = {}) {
+export async function run(token, {
+  signal,
+  api = API,
+  statePath = STATE,
+  fetchImpl = fetch,
+  feed = FEED,
+} = {}) {
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
   async function call(method, body) {
@@ -391,19 +535,65 @@ export async function run(token, { signal, api = API, statePath = STATE } = {}) 
   }
 
   async function onMessage(message) {
+    // Check for help request first
+    const helpAsked = askedHelpFor(message, me);
+    if (helpAsked) {
+      console.log(`    -> help request`);
+      await say(message.conversationId, HELP_TEXT, message.messageId);
+      return;
+    }
+
+    // Check for stock market commands: <mã> tran|san <giá> [sàn]
+    const stockLookup = parseStockLookup(message.text ?? '');
+    if (stockLookup) {
+      const { symbol, isCeiling, targetPrice, exchange } = stockLookup;
+      console.log(`    -> stock lookup: ${symbol} ${isCeiling ? 'vebo' : 'dallas'} ${targetPrice} ${exchange}`);
+
+      try {
+        const quote = await fetchPrice(symbol, { feed, fetchImpl });
+        if (!quote) {
+          await say(message.conversationId, `Không tìm thấy giá ${symbol}.`, message.messageId);
+          return;
+        }
+
+        const result = isCeiling
+          ? calcCeilingSessions(quote.price, targetPrice, exchange)
+          : calcFloorSessions(quote.price, targetPrice, exchange);
+
+        const answer = formatStockResult(symbol, quote.price, result, isCeiling);
+        console.log(`    -> ${answer}`);
+        await say(message.conversationId, answer, message.messageId);
+      } catch (problem) {
+        console.error(`    -> stock lookup failed: ${problem}`);
+        await say(message.conversationId, `Không lấy được giá ${symbol}. Thử lại sau.`, message.messageId);
+      }
+      return;
+    }
+
     const asked = askedCalcFor(message, me);
     if (!asked) return;
+    const isAuthor = message.from?.username === AUTHOR;
     if (!asked.expression) {
-      const roast = ROASTS[Math.floor(Math.random() * ROASTS.length)];
-      console.log(`    -> @${me.username} nhưng không có biểu thức → chửi`);
-      await say(message.conversationId, roast, message.messageId);
+      if (isAuthor) {
+        console.log(`    -> @${me.username} nhưng không có biểu thức → tác giả, nhắc nhẹ`);
+        await say(message.conversationId, 'Không có biểu thức nào để tính. Gõ lại nhé!', message.messageId);
+      } else {
+        const roast = ROASTS[Math.floor(Math.random() * ROASTS.length)];
+        console.log(`    -> @${me.username} nhưng không có biểu thức → chửi`);
+        await say(message.conversationId, roast, message.messageId);
+      }
       return;
     }
     const result = safeCalc(asked.expression);
     if (typeof result === 'number' && Number.isNaN(result)) {
-      const roast = ROASTS[Math.floor(Math.random() * ROASTS.length)];
-      console.log(`    -> "${asked.expression}" → biểu thức sai → chửi`);
-      await say(message.conversationId, roast, message.messageId);
+      if (isAuthor) {
+        console.log(`    -> "${asked.expression}" → biểu thức sai → tác giả, nhắc nhẹ`);
+        await say(message.conversationId, 'Biểu thức không hợp lệ, thử lại nhé!', message.messageId);
+      } else {
+        const roast = ROASTS[Math.floor(Math.random() * ROASTS.length)];
+        console.log(`    -> "${asked.expression}" → biểu thức sai → chửi`);
+        await say(message.conversationId, roast, message.messageId);
+      }
       return;
     }
     const answer = fmt(result);

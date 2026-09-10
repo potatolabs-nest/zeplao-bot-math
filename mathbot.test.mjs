@@ -6,7 +6,10 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as wait } from 'node:timers/promises';
 
-import { askedCalcFor, safeCalc, run } from './mathbot.mjs';
+import {
+  askedCalcFor, safeCalc, run, AUTHOR,
+  parseStockLookup, calcCeilingSessions, calcFloorSessions, fetchPrice,
+} from './mathbot.mjs';
 
 const ME = { username: 'mathtanbot', displayName: 'mathbot' };
 const ROASTS = [
@@ -196,17 +199,39 @@ async function stubApi(updates) {
   return { sent, api: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
 }
 
-async function withBot(updates, { expect = 1, settle = 200 } = {}) {
+function stubFeed(prices) {
+  const server = createServer((request, response) => {
+    const symbol = request.url.split('/').pop();
+    const data = prices[symbol] ? [{ sym: symbol, lastPrice: prices[symbol], r: prices[symbol] }] : [];
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify(data));
+  });
+  return new Promise((ready) => {
+    server.listen(0, '127.0.0.1', () => {
+      ready({ feed: `http://127.0.0.1:${server.address().port}`, close: () => server.close() });
+    });
+  });
+}
+
+async function withBot(updates, { expect = 1, settle = 200, prices = {} } = {}) {
   const platform = await stubApi(updates);
+  const feedServer = await stubFeed(prices);
   const stopping = new AbortController();
   const statePath = join(tmpdir(), `math-${randomUUID()}.json`);
-  const loop = run('token', { signal: stopping.signal, api: platform.api, statePath });
+  const loop = run('token', {
+    signal: stopping.signal,
+    api: platform.api,
+    statePath,
+    fetchImpl: fetch,
+    feed: feedServer.feed,
+  });
   const deadline = Date.now() + 5000;
   while (platform.sent.length < expect && Date.now() < deadline) await wait(20);
   await wait(settle);
   stopping.abort();
   await loop.catch(() => {});
   platform.close();
+  feedServer.close();
   return platform;
 }
 
@@ -241,4 +266,127 @@ test('biểu thức sai thì roast', async () => {
 test('nhóm không mention thì im', async () => {
   const { sent } = await withBot([update({ text: '1 + 1' })], { expect: 0 });
   assert.deepEqual(sent, []);
+});
+
+// ---- author exemption -------------------------------------------------------------------------
+
+test('tác giả gửi biểu thức sai → nhắc nhẹ, không chửi', async () => {
+  const { sent } = await withBot([update({ text: '@mathtanbot abc', from: { username: AUTHOR } })]);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].text, 'Biểu thức không hợp lệ, thử lại nhé!');
+});
+
+test('tác giả gửi không có biểu thức → nhắc nhẹ', async () => {
+  const { sent } = await withBot([update({ text: '@mathtanbot', from: { username: AUTHOR } })]);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].text, 'Không có biểu thức nào để tính. Gõ lại nhé!');
+});
+
+test('người khác gửi biểu thức sai → vẫn chửi', async () => {
+  const { sent } = await withBot([update({ text: '@mathtanbot abc', from: { username: 'someoneelse' } })]);
+  assert.equal(sent.length, 1);
+  assert.ok(ROASTS.includes(sent[0].text), `expected roast, got: ${sent[0].text}`);
+});
+
+// ---- stock market (trần/sàn) ----------------------------------------------------------------
+
+test('parseStockLookup: pom vebo 7', () => {
+  const cmd = parseStockLookup('pom vebo 7');
+  assert.deepEqual(cmd, { symbol: 'POM', isCeiling: true, targetPrice: 7, exchange: 'hose' });
+});
+
+test('parseStockLookup: pnj dallas 20', () => {
+  const cmd = parseStockLookup('pnj dallas 20');
+  assert.deepEqual(cmd, { symbol: 'PNJ', isCeiling: false, targetPrice: 20, exchange: 'hose' });
+});
+
+test('parseStockLookup: vic vebo 50 upcom', () => {
+  const cmd = parseStockLookup('vic vebo 50 upcom');
+  assert.deepEqual(cmd, { symbol: 'VIC', isCeiling: true, targetPrice: 50, exchange: 'upcom' });
+});
+
+test('parseStockLookup: @mathtanbot pom vebo 7', () => {
+  const cmd = parseStockLookup('@mathtanbot pom vebo 7');
+  assert.deepEqual(cmd, { symbol: 'POM', isCeiling: true, targetPrice: 7, exchange: 'hose' });
+});
+
+test('parseStockLookup: không phải lệnh stock', () => {
+  assert.equal(parseStockLookup('1 + 1'), null);
+  assert.equal(parseStockLookup('abc'), null);
+  assert.equal(parseStockLookup('pom tran'), null);
+});
+
+test('calcCeilingSessions: giá 7 lên 10 HOSE', () => {
+  const result = calcCeilingSessions(7, 10, 'hose');
+  assert.equal(result.sessions, 6);
+  assert.equal(result.exchange, 'hose');
+  assert.equal(result.limit, 0.07);
+});
+
+test('calcFloorSessions: giá 100 về 50 HOSE', () => {
+  const result = calcFloorSessions(100, 50, 'hose');
+  assert.equal(result.sessions, 10);
+  assert.equal(result.finalPrice, 48.4);
+});
+
+test('calcCeilingSessions: giá 1000 lên 1500 UPCOM', () => {
+  const result = calcCeilingSessions(1000, 1500, 'upcom');
+  assert.equal(result.sessions, 3);
+  assert.equal(result.exchange, 'upcom');
+  assert.equal(result.limit, 0.15);
+});
+
+test('fetchPrice: lấy giá từ feed', async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify([{ sym: 'POM', lastPrice: '5.2', r: '5.0' }]));
+  });
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  const feed = `http://127.0.0.1:${server.address().port}`;
+
+  const quote = await fetchPrice('POM', { feed });
+  assert.equal(quote.symbol, 'POM');
+  assert.equal(quote.price, 5.2);
+  assert.equal(quote.traded, true);
+  server.close();
+});
+
+test('fetchPrice: mã không tồn tại', async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify([]));
+  });
+  await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
+  const feed = `http://127.0.0.1:${server.address().port}`;
+
+  const quote = await fetchPrice('ZZZ', { feed });
+  assert.equal(quote, null);
+  server.close();
+});
+
+test('@mathtanbot pom vebo 7 — lookup giá rồi tính', async () => {
+  const { sent } = await withBot(
+    [update({ text: '@mathtanbot pom vebo 7' })],
+    { prices: { POM: 5.2 } },
+  );
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /POM 5\.2/);
+  assert.match(sent[0].text, /phiên vebo HOSE/);
+});
+
+test('@mathtanbot pnj dallas 20 — lookup giá rồi tính', async () => {
+  const { sent } = await withBot(
+    [update({ text: '@mathtanbot pnj dallas 20' })],
+    { prices: { PNJ: 100 } },
+  );
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /PNJ 100/);
+  assert.match(sent[0].text, /phiên dallas HOSE/);
+});
+
+test('@mathtanbot help trả về help', async () => {
+  const { sent } = await withBot([update({ text: '@mathtanbot help' })]);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /Cú pháp tính toán/);
+  assert.match(sent[0].text, /pom vebo 7/);
 });
