@@ -344,6 +344,13 @@ const EXCHANGE_NAMES = {
 const FEED = process.env.BOCO_FEED ?? 'https://bgapidatafeed.vps.com.vn';
 const TIMEOUT_MS = 8000;
 
+const MARKET_TO_EXCHANGE = {
+  'HOSE': 'hose',
+  'HNX': 'hnx',
+  'UPX': 'upcom',
+  'UPCOM': 'upcom',
+};
+
 export async function fetchPrice(symbol, { feed = FEED, fetchImpl = fetch } = {}) {
   const url = `${feed}/getliststockdata/${symbol.toUpperCase()}`;
   const response = await fetchImpl(url, { signal: AbortSignal.timeout(TIMEOUT_MS) });
@@ -355,9 +362,10 @@ export async function fetchPrice(symbol, { feed = FEED, fetchImpl = fetch } = {}
   const reference = Number(raw.r) || 0;
   return {
     symbol: raw.sym,
-    price: price > 0 ? price : reference,  // dùng tham chiếu nếu chưa khớp
+    price: price > 0 ? price : reference,
     reference,
     traded: price > 0,
+    exchange: MARKET_TO_EXCHANGE[raw.marketId] ?? MARKET_TO_EXCHANGE[raw.mc] ?? 'hose',
   };
 }
 
@@ -563,8 +571,8 @@ export async function run(token, {
     // Check for stock market commands: <mã> tran|san <giá> [sàn]
     const stockLookup = parseStockLookup(message.text ?? '');
     if (stockLookup) {
-      const { symbol, isCeiling, targetPrice, exchange } = stockLookup;
-      console.log(`    -> stock lookup: ${symbol} ${isCeiling ? 'vebo' : 'dallas'} ${targetPrice} ${exchange}`);
+      const { symbol, isCeiling, targetPrice } = stockLookup;
+      let { exchange } = stockLookup;
 
       try {
         const quote = await fetchPrice(symbol, { feed, fetchImpl });
@@ -572,6 +580,14 @@ export async function run(token, {
           await say(message.conversationId, `Không tìm thấy giá ${symbol}.`, message.messageId);
           return;
         }
+
+        // Dùng sàn từ feed nếu user không chỉ định sàn
+        const userSpecifiedExchange = /\s+(hose|hnx|upcom)\s*$/i.test((message.text ?? '').trim());
+        if (!userSpecifiedExchange && quote.exchange) {
+          exchange = quote.exchange;
+        }
+
+        console.log(`    -> stock lookup: ${symbol} ${isCeiling ? 'vebo' : 'dallas'} ${targetPrice} ${exchange}`);
 
         const result = isCeiling
           ? calcCeilingSessions(quote.price, targetPrice, exchange)
