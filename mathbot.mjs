@@ -423,13 +423,28 @@ function formatStockResult(symbol, currentPrice, result, isCeiling) {
   const exchangeName = EXCHANGE_NAMES[exchange.toLowerCase()] ?? exchange.toUpperCase();
   const action = isCeiling ? 'vebo' : 'dallas';
   const arrow = isCeiling ? '↑' : '↓';
+  const percent = Math.round(limit * 100);
 
   if (sessions === 0) {
     return `${symbol} ${fmt(currentPrice)} — không cần phiên ${action} nào. Giá mục tiêu đã đạt.`;
   }
 
-  return `${symbol} ${fmt(currentPrice)} → ${sessions} phiên ${action} ${exchangeName}
-${arrow} Giá cuối: ${fmt(finalPrice)}`;
+  // Tính từng phiên để giải thích
+  const steps = [];
+  let price = currentPrice;
+  for (let i = 1; i <= sessions; i++) {
+    const next = isCeiling
+      ? Math.round(price * (1 + limit) * 100) / 100
+      : Math.round(price * (1 - limit) * 100) / 100;
+    steps.push(`${i}. ${fmt(price)} × ${percent}% → ${fmt(next)}`);
+    price = next;
+  }
+
+  const header = `${symbol} ${fmt(currentPrice)} → ${sessions} phiên ${action} ${exchangeName}`;
+  const detail = steps.join('\n');
+  const footer = `${arrow} Giá cuối: ${fmt(finalPrice)}`;
+
+  return `${header}\n${detail}\n${footer}`;
 }
 
 // ---- help -------------------------------------------------------------------------------------
@@ -440,6 +455,8 @@ const HELP_TEXT = `Cú pháp tính toán:
 Cú pháp tính phiên vebo/dallas (tự động lấy giá hiện tại):
 @mathtanbot <mã> vebo <giá_mục_tiêu> [sàn]
 @mathtanbot <mã> dallas <giá_mục_tiêu> [sàn]
+
+Lưu ý: giá_mục_tiêu ĐẶT TRƯỚC, sàn ĐẶT SAU.
 
 Sàn giao dịch (mặc định: hose):
 • hose — HOSE (7%)
