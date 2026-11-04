@@ -455,10 +455,219 @@ function formatStockResult(symbol, currentPrice, result, isCeiling) {
   return `${header}\n${detail}\n${footer}`;
 }
 
+// ---- vietqr: tài khoản nhận tiền của từng người -----------------------------------------------
+//
+// Ai đó gõ `register` một lần, số tài khoản nằm lại trong state; từ đó `gen-qr` dựng mã chuyển
+// tiền cho chính người ấy. Khoá theo `userId` chứ không theo username: username có thể null và
+// đổi được, còn userId thì không.
+//
+// Ảnh lấy từ Quick Link của VietQR (https://www.vietqr.io/qr-dong) — một URL, không cần khoá, và
+// trả về SVG. Nhưng thứ nó trả về chỉ là cái vỏ: cả tấm card nằm gọn trong một thẻ
+// `<image href="data:image/png;base64,...">`. Bóc ruột ra là được đúng tấm PNG mà nền tảng nhận
+// (`dataBase64`), khỏi gọi API sinh mã, khỏi tự vẽ.
+
+export const VIETQR_IMAGE = process.env.VIETQR_IMAGE ?? 'https://img.vietqr.io';
+export const VIETQR_API = process.env.VIETQR_API ?? 'https://api.vietqr.io';
+export const QR_TEMPLATE = process.env.VIETQR_TEMPLATE ?? 'compact2';
+
+const BANK_TTL_MS = 6 * 60 * 60 * 1000;   // danh sách ngân hàng đổi rất chậm
+const MOST_IMAGE_BYTES = 2_000_000;       // nền tảng từ chối ảnh quá 2 MB
+const MOST_DESCRIPTION = 50;              // VietQR: nội dung tối đa 50 chữ cái
+
+// Gốc API → { at, index }. Nhớ theo gốc chứ không nhớ chung: bộ test dựng server giả ở cổng khác
+// nhau, mà một cái cache không tên sẽ trả danh sách của server trước cho server sau.
+const bankCache = new Map();
+
+function escapeForRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Bỏ đúng mention của bot, để phần còn lại là câu lệnh. */
+export function stripBotMention(text, me) {
+  let body = String(text ?? '');
+  for (const handle of [me?.username, me?.displayName].filter(Boolean)) {
+    body = body.replace(new RegExp(`@${escapeForRegExp(handle)}`, 'gi'), ' ');
+  }
+  return body.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeBankKey(value) {
+  return String(value ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** Danh sách ngân hàng của VietQR, tra một lần rồi nhớ. */
+export async function bankDirectory({ api = VIETQR_API, fetchImpl = fetch, now = Date.now() } = {}) {
+  const cached = bankCache.get(api);
+  if (cached && now - cached.at < BANK_TTL_MS) return cached.index;
+
+  const response = await fetchImpl(`${api}/v2/banks`, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  if (!response.ok) throw new Error(`danh sách ngân hàng trả lời ${response.status}`);
+  const payload = await response.json();
+  const banks = Array.isArray(payload?.data) ? payload.data : [];
+  if (!banks.length) throw new Error('danh sách ngân hàng rỗng');
+
+  // Một ngân hàng có nhiều tên gọi, ai gõ cái nào cũng phải ra. Trùng khoá thì tên viết tắt và mã
+  // BIN thắng tên đầy đủ — người ta gõ `vcb` chứ ít ai gõ cả dòng tên pháp lý.
+  const index = new Map();
+  const put = (alias, bank, priority) => {
+    const key = normalizeBankKey(alias);
+    if (!key) return;
+    const seen = index.get(key);
+    if (!seen || priority > seen.priority) index.set(key, { bank, priority });
+  };
+  for (const bank of banks) {
+    put(bank.short_name, bank, 1);
+    put(bank.shortName, bank, 2);
+    put(bank.bin, bank, 3);
+    put(bank.code, bank, 4);
+  }
+
+  bankCache.set(api, { at: now, index });
+  return index;
+}
+
+/** Ngân hàng theo đúng cách người dùng gọi tên, hoặc null nếu không có ngân hàng nào như vậy. */
+export async function lookupBank(token, options = {}) {
+  const found = (await bankDirectory(options)).get(normalizeBankKey(token));
+  if (!found) return null;
+  const { bank } = found;
+  return {
+    bankId: String(bank.bin || bank.code || ''),
+    label: bank.shortName || bank.short_name || bank.code || String(bank.bin ?? ''),
+    code: bank.code,
+  };
+}
+
+/**
+ * Số tiền người Việt gõ: `100000`, `100.000`, `100,000`, `100k`, `1,5tr`, `2 triệu`.
+ *
+ * Dấu chấm đứng giữa từng nhóm ba chữ số là dấu nghìn, còn lại là dấu thập phân. Đoán sai thì ra
+ * một con số vô lý mà không ai biết là sai, nên chỉ nhận những dạng đọc được rõ ràng; còn lại trả
+ * null để bot hỏi lại.
+ */
+export function parseAmount(raw) {
+  let text = String(raw ?? '').trim().toLowerCase().replace(/\s+/g, '');
+  if (!text) return null;
+
+  const units = { k: 1e3, nghìn: 1e3, tr: 1e6, triệu: 1e6, m: 1e6, tỷ: 1e9, ty: 1e9 };
+  const suffix = /(k|tr|m|triệu|nghìn|tỷ|ty)$/.exec(text);
+  let unit = 1;
+  if (suffix) {
+    unit = units[suffix[1]];
+    text = text.slice(0, -suffix[1].length);
+  }
+  if (!text) return null;
+
+  if (/^\d{1,3}(?:\.\d{3})+$/.test(text) || /^\d{1,3}(?:,\d{3})+$/.test(text)) text = text.replace(/[.,]/g, '');
+  else if (text.includes(',')) text = text.replace(/\./g, '').replace(',', '.');
+  else if (!/^\d+(?:\.\d+)?$/.test(text)) return null;
+
+  const value = Math.round(Number(text) * unit);
+  if (!Number.isFinite(value) || value < 1 || value > 9_999_999_999_999) return null;   // VietQR: tối đa 13 chữ số
+  return value;
+}
+
+/** Nội dung chuyển khoản: VietQR chỉ nhận chữ, số và khoảng trắng, tối đa 50 ký tự. */
+export function cleanDescription(raw) {
+  return String(raw ?? '')
+    .replace(/[^\p{L}\p{N} ]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MOST_DESCRIPTION);
+}
+
+export function formatMoney(value) {
+  return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+/** `register <ngân hàng> <số tài khoản> <tên chủ tài khoản>` — tên đứng cuối nên được có dấu cách. */
+export function parseRegister(text, me) {
+  const match = /^register\s+(\S+)\s+(\S+)\s+(.+)$/i.exec(stripBotMention(text, me));
+  if (!match) return null;
+  return {
+    bankToken: match[1],
+    accountNo: match[2],
+    name: match[3].replace(/\s+/g, ' ').trim(),
+  };
+}
+
+/** `gen-qr [số tiền] [nội dung]` — không có số tiền thì mã vẫn dựng, chỉ là để trống. */
+export function parseQrRequest(text, me) {
+  const match = /^gen-?qr(?:\s+([\s\S]+))?$/i.exec(stripBotMention(text, me));
+  if (!match) return null;
+  const rest = (match[1] ?? '').trim();
+  if (!rest) return { amount: null, description: '' };
+
+  const [first, ...tail] = rest.split(/\s+/);
+  const amount = parseAmount(first);
+  if (amount === null) return { amount: null, description: cleanDescription(rest), unreadable: first };
+  return { amount, description: cleanDescription(tail.join(' ')) };
+}
+
+/**
+ * Ảnh QR và đường link của nó.
+ *
+ * Ảnh là null khi VietQR từ chối dựng — lúc ấy link vẫn còn nguyên để gửi kèm, vì một cái link
+ * bấm được vẫn hơn một câu xin lỗi.
+ */
+export async function fetchQr(account, { amount = null, description = '' } = {}, { image = VIETQR_IMAGE, fetchImpl = fetch } = {}) {
+  const query = new URLSearchParams();
+  if (amount) query.set('amount', String(amount));
+  if (description) query.set('addInfo', description);
+  if (account.name) query.set('accountName', account.name);
+  const params = query.toString();
+  const link = `${image}/image/${account.bankId}-${account.accountNo}-${QR_TEMPLATE}.svg${params ? `?${params}` : ''}`;
+
+  const response = await fetchImpl(link, { signal: AbortSignal.timeout(TIMEOUT_MS) });
+  const body = await response.text();
+  if (!response.ok) return { link, image: null, status: response.status };
+
+  const embedded = /data:image\/png;base64,([A-Za-z0-9+/=]+)/.exec(body);
+  if (embedded && embedded[1].length <= MOST_IMAGE_BYTES) {
+    return {
+      link,
+      image: { fileName: `vietqr-${account.accountNo}.png`, contentType: 'image/png', dataBase64: embedded[1] },
+      status: response.status,
+    };
+  }
+  if (/<svg[\s>]/i.test(body) && body.length <= MOST_IMAGE_BYTES) {
+    return {
+      link,
+      image: { fileName: `vietqr-${account.accountNo}.svg`, contentType: 'image/svg+xml', svg: body },
+      status: response.status,
+    };
+  }
+  return { link, image: null, status: response.status };
+}
+
+/** Chữ đi kèm ảnh QR — số tiền và nội dung phải đọc được cả khi không mở ảnh. */
+export function qrCaption(account, amount, description) {
+  const lines = [`QR chuyển tiền — ${account.bankLabel} ${account.accountNo}`, account.name];
+  lines.push(amount === null ? 'Số tiền: để trống, người chuyển tự nhập' : `Số tiền: ${formatMoney(amount)}đ`);
+  if (description) lines.push(`Nội dung: ${description}`);
+  return lines.join('\n');
+}
+
 // ---- help -------------------------------------------------------------------------------------
+
+const usageRegister = (bot) => `Cú pháp: @${bot} register <ngân hàng> <số tài khoản> <tên chủ tài khoản>
+Ví dụ: @${bot} register timo 0905473034 nguyen tan hieu`;
+
+const usageQr = (bot) => `Cú pháp: @${bot} gen-qr <số tiền> <nội dung>
+Ví dụ: @${bot} gen-qr 100k tra tien an trua
+Số tiền hiểu được: 100000, 100.000, 100k, 1,5tr, 2 triệu.`;
 
 const HELP_TEXT = `Cú pháp tính toán:
 @mathtanbot <biểu thức> — ví dụ: @mathtanbot 2 + 3 * 4
+
+Đăng ký tài khoản nhận tiền, một lần:
+@mathtanbot register <ngân hàng> <số tài khoản> <tên chủ tài khoản>
+Ví dụ: @mathtanbot register timo 0905473034 nguyen tan hieu
+
+Xem mã QR chuyển tiền của chính mình:
+@mathtanbot gen-qr <số tiền> <nội dung>
+Ví dụ: @mathtanbot gen-qr 100k tra tien an trua
+Số tiền hiểu được: 100000, 100.000, 100k, 1,5tr, 2 triệu.
 
 Cú pháp tính phiên vebo/dallas (tự động lấy giá hiện tại):
 @mathtanbot <mã> vebo <giá_mục_tiêu> [sàn]
@@ -526,6 +735,7 @@ export async function run(token, {
   const me = await call('getMe');
   const state = loadState(statePath);
   let offset = Number(state.offset) || 0;
+  const accounts = state.accounts ?? {};
   console.log(`@${me.username} đang trực | offset=${offset}`);
 
   for (;;) {
@@ -544,7 +754,7 @@ export async function run(token, {
 
     for (const update of updates) {
       offset = update.id;
-      saveState(statePath, { offset });
+      saveState(statePath, { offset, accounts });
       try {
         if (update.kind === 'message') {
           const m = update.message;
@@ -559,12 +769,128 @@ export async function run(token, {
     }
   }
 
+  /**
+   * Lưu tài khoản rồi trả về chính mã QR của nó để người gõ nhìn mà kiểm.
+   *
+   * Đọc ảnh người dùng gửi là chuyện nền tảng không cho (`messageType` chỉ có text và sticker),
+   * nên không có cách nào tự bóc mã QR của họ ra. Đổi lại: sai thì thấy ngay trong tấm card vừa
+   * gửi, và gõ lại `register` là xong — rẻ hơn nhiều so với việc phát hiện lúc đã có người chuyển
+   * tiền vào một số tài khoản không phải của mình.
+   */
+  async function onRegister(message, registration) {
+    const userId = message.from?.userId;
+    if (!userId) return;
+
+    let bank;
+    try {
+      bank = await lookupBank(registration.bankToken, { fetchImpl });
+    } catch (problem) {
+      console.error(`    -> tra danh sách ngân hàng hỏng: ${problem}`);
+      await say(message.conversationId, 'Chưa tra được danh sách ngân hàng, thử lại sau nhé.', message.messageId);
+      return;
+    }
+    if (!bank) {
+      await say(
+        message.conversationId,
+        `Không có ngân hàng nào tên "${registration.bankToken}". Thử tên viết tắt hoặc mã BIN, ví dụ: timo, vcb, tcb, 970436.`,
+        message.messageId,
+      );
+      return;
+    }
+
+    // Số tài khoản dính liền dấu gạch vì người ta hay gõ `090-547-3034`; cắt hết trước khi kiểm.
+    const accountNo = registration.accountNo.replace(/[.\-\s]/g, '');
+    if (!/^[A-Za-z0-9]{4,19}$/.test(accountNo)) {
+      await say(
+        message.conversationId,
+        `Số tài khoản "${registration.accountNo}" không hợp lệ. VietQR nhận 4–19 ký tự chữ hoặc số.`,
+        message.messageId,
+      );
+      return;
+    }
+
+    const account = { bankId: bank.bankId, bankLabel: bank.label, accountNo, name: registration.name };
+    accounts[userId] = account;
+    saveState(statePath, { offset, accounts });
+
+    // Thử dựng luôn tấm xác nhận. Ngân hàng tra được mà mã không dựng nổi thì số tài khoản nhiều
+    // khả năng sai — đừng lưu một thứ chưa từng dựng được thành mã.
+    let card;
+    try {
+      card = await fetchQr(account, {}, { fetchImpl });
+    } catch (problem) {
+      console.error(`    -> dựng QR xác nhận hỏng: ${problem}`);
+      card = { image: null, link: null };
+    }
+
+    const confirmed = card.image
+      ? `Đã lưu tài khoản nhận tiền:\n${bank.label} · ${accountNo} · ${account.name}\n\nMã dưới đây là của chính tài khoản này — sai thì gõ lại register.`
+      : null;
+
+    if (confirmed) {
+      console.log(`    -> register ${bank.label} ${accountNo} (có mã xác nhận)`);
+      await say(message.conversationId, confirmed, message.messageId, { image: card.image });
+      return;
+    }
+
+    await say(
+      message.conversationId,
+      `Đã lưu ${bank.label} · ${accountNo} · ${account.name}, nhưng chưa dựng được mã QR để xác nhận. Kiểm lại số tài khoản nếu thấy sai.`,
+      message.messageId,
+    );
+  }
+
+  /** Mã QR chuyển tiền của người đang gõ. */
+  async function onGenQr(message, asked) {
+    const userId = message.from?.userId;
+    const account = userId ? accounts[userId] : null;
+    if (!account) {
+      await say(message.conversationId, `Bạn chưa đăng ký tài khoản nhận tiền.\n${usageRegister(me.username)}`, message.messageId);
+      return;
+    }
+
+    let card;
+    try {
+      card = await fetchQr(account, { amount: asked.amount, description: asked.description }, { fetchImpl });
+    } catch (problem) {
+      console.error(`    -> dựng QR hỏng: ${problem}`);
+      await say(message.conversationId, 'Chưa dựng được mã QR, thử lại sau nhé.', message.messageId);
+      return;
+    }
+
+    const caption = qrCaption(account, asked.amount, asked.description);
+    console.log(`    -> gen-qr ${account.bankLabel} ${account.accountNo} amount=${asked.amount}`);
+
+    // Ảnh là phần chính, nhưng không phải phần duy nhất: máy chủ từ chối ảnh thì câu trả lời vẫn
+    // phải đi, kèm link bấm được để người ta tự mở mã.
+    if (card.image) {
+      await say(message.conversationId, caption, message.messageId, { image: card.image });
+      return;
+    }
+    const fallback = card.link ? `${caption}\n\nMã QR: ${card.link}` : caption;
+    await say(message.conversationId, fallback, message.messageId);
+  }
+
   async function onMessage(message) {
     // Check for help request first
     const helpAsked = askedHelpFor(message, me);
     if (helpAsked) {
       console.log(`    -> help request`);
       await say(message.conversationId, HELP_TEXT, message.messageId);
+      return;
+    }
+
+    // Đăng ký tài khoản nhận tiền
+    const registration = parseRegister(message.text ?? '', me);
+    if (registration) {
+      await onRegister(message, registration);
+      return;
+    }
+
+    // Mã QR chuyển tiền của người đang gõ
+    const askedQr = parseQrRequest(message.text ?? '', me);
+    if (askedQr) {
+      await onGenQr(message, askedQr);
       return;
     }
 
@@ -634,10 +960,25 @@ export async function run(token, {
     await say(message.conversationId, answer, message.messageId);
   }
 
-  async function say(conversationId, text, replyToMessageId) {
+  /**
+   * Nói một câu, kèm ảnh nếu có.
+   *
+   * Ảnh không đi được thì chữ vẫn đi — một câu trả lời thiếu hình vẫn hơn im lặng, và người hỏi
+   * chưa biết là bot vừa hỏng.
+   */
+  async function say(conversationId, text, replyToMessageId, { image } = {}) {
+    if (image) {
+      const posted = await send(conversationId, { text, image }, replyToMessageId);
+      if (posted) return posted;
+      console.error('    -> ảnh không gửi được, gửi lại bằng chữ');
+    }
+    return send(conversationId, { text }, replyToMessageId);
+  }
+
+  async function send(conversationId, content, replyToMessageId) {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const result = await call('sendMessage', { conversationId, text, replyToMessageId });
+        const result = await call('sendMessage', { conversationId, ...content, replyToMessageId });
         console.log(`    -> đã gửi vào ${conversationId}`);
         return result;
       } catch (problem) {
