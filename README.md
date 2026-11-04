@@ -61,15 +61,17 @@ VietQR trả về SVG gồm hai phần:
 - một `<image>` phủ kín khung — nền, có logo ngân hàng, tên chủ tài khoản, số tiền, nội dung
 - một `<path>` vẽ từng module của mã, nằm trong `<g transform>`
 
-Tấm nguyên bản hợp lệ theo đúng luật máy chủ ghi (có thẻ `svg`, không script, không foreignObject,
-không handler, không link ngoài), nên nó được gửi **trước tiên**. Ba bản sau chỉ để câu trả lời
-không mất hình khi tấm ấy bị từ chối, hoặc bị nhận mà bộ lọc của máy chủ bỏ mất `<g transform>`:
+**Tấm SVG ấy không gửi thẳng đi được.** Bộ vẽ SVG của nền tảng không vẽ thẻ `<image href="data:...">`,
+mà nền nằm đúng trong thẻ ấy — gửi SVG thì người nhận thấy mỗi mã trơ trên nền trắng, mất khung,
+mất logo. Ảnh raster thì nó vẽ được.
 
-1. nguyên bản của VietQR
-2. `composeQrSvg` — đúng nội dung ấy, vẽ lại bằng toạ độ tuyệt đối, không `transform`, và để nguyên
-   khoảng trống mà nền đã chừa sẵn cho mã (không vẽ ô trắng, vì ô trắng sẽ che dòng số tài khoản)
-3. `qrSvg` — chỉ mã, không nền
-4. `qrPng` — PNG RGBA
+Nên `composeCardPng` giải tấm nền ra khỏi SVG (`decodePng`), vẽ lưới mã đè lên đúng chỗ nền chừa
+sẵn, rồi trả về **một tấm PNG duy nhất** — raster thì không có thẻ nào để bộ vẽ bỏ qua. Đó là đường
+duy nhất có cả khung lẫn mã, nên nó đi trước:
+
+1. `composeCardPng` — nền + mã trong một tấm PNG
+2. `qrPng` — chỉ mã, dạng PNG
+3. `qrSvg` — chỉ mã, dạng SVG
 
 Cuối cùng mới tới chữ không ảnh. Chữ của tin có ảnh đi kèm dưới dạng `rich`, không phải `text` trần.
 

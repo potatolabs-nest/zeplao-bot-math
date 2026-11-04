@@ -626,8 +626,12 @@ export function qrLink(account, { amount = null, description = '' } = {}, { imag
  * dựng bản thay thế cho trường hợp tấm ấy bị từ chối, hoặc bị nhận mà bộ lọc của máy chủ bỏ mất
  * `<g transform>` khiến mã nằm sai chỗ.
  *
- * Bóc tấm nền ra thì người nhận thấy khung với logo mà giữa trống; bóc hình vector ra thì thấy mã
- * trơ, mất hết thông tin chuyển khoản. Nên ở đây bóc **cả hai**, rồi `composeQrSvg` ghép lại.
+ * Tấm SVG ấy không gửi thẳng đi được, và cũng không bóc một nửa được: bộ vẽ SVG của nền tảng
+ * **không vẽ thẻ `<image href="data:...">`**, mà nền — khung, logo, số tài khoản — nằm đúng trong
+ * thẻ ấy. Gửi SVG thì ra mỗi mã trơ trên nền trắng. Ảnh raster thì nó vẽ được.
+ *
+ * Nên hàm này bóc **cả hai** phần ra khỏi SVG: nền để `composeCardPng` giải và ghép mã vào thành
+ * một tấm PNG duy nhất, lưới mã để dựng lại thành ảnh khi cần đường lùi.
  */
 export function parseQrSvg(svg) {
   const group = /<g\b[^>]*transform="translate\(\s*([\d.]+)[\s,]+([\d.]+)\s*\)\s*scale\(\s*([\d.]+)\s*\)"[^>]*>([\s\S]*?)<\/g>/.exec(svg);
@@ -654,11 +658,9 @@ export function parseQrSvg(svg) {
   }
   if (runs < 50) return null;
 
-  // Nền là ảnh đầu tiên; bỏ nó đi thì tấm card mất khung, mất logo, mất tên. Kích thước của nó
-  // cũng chính là khổ tấm card, nên phải lấy theo nó chứ không theo lưới mã — lưới chỉ là một phần
-  // nằm trong ấy.
-  const image = /<image\b([^>]*)\bhref="(data:image\/[\w+.-]+;base64,[^"]+)"([^>]*)>/.exec(svg);
-  const sizeOf = (attrs, name) => Number(new RegExp(`\\b${name}="([\\d.]+)"`).exec(attrs)?.[1]);
+  // Nền là ảnh đầu tiên; bỏ nó đi thì tấm card mất khung, mất logo, mất tên — mà lại chính là thứ
+  // bộ vẽ SVG của nền tảng không vẽ được. `composeCardPng` giải nó ra để ghép mã vào.
+  const image = /<image\b[^>]*\bhref="(data:image\/[\w+.-]+;base64,[^"]+)"[^>]*>/.exec(svg);
 
   return {
     size,
@@ -667,10 +669,7 @@ export function parseQrSvg(svg) {
     quiet: 4,
     at: { x: translateX, y: translateY },
     scale,
-    background: image ? image[2] : null,
-    backgroundSize: image
-      ? { width: sizeOf(image[1] + image[3], 'width'), height: sizeOf(image[1] + image[3], 'height') }
-      : null,
+    background: image ? image[1] : null,
   };
 }
 
@@ -692,83 +691,156 @@ function pngChunk(type, body) {
   return Buffer.concat([head, body, tail]);
 }
 
-/**
- * Lưới module thành PNG, mỗi module `scale` điểm ảnh, viền trắng `quiet` module.
- *
- * Ghi ra **RGBA**, không phải thang xám: đen trắng thì thang xám là lẽ tự nhiên, và đó chính là
- * kiểu đã bị máy chủ nhận rồi mà không hiện — ảnh nào render được cũng là RGBA. Bốn kênh là thứ
- * mọi đường xử lý ảnh đều chắc chắn đọc được, còn thang xám thì không phải đường nào cũng có.
- */
-export function qrPng(grid, { scale = 8, quiet = 4 } = {}) {
-  const size = grid.length;
-  const side = (size + quiet * 2) * scale;
-  const row = Buffer.alloc(side * 4, 0xff);   // một dòng trắng, chép lại cho mọi dòng trắng
-  const rows = [];
-  for (let i = 0; i < quiet * scale; i++) rows.push(row);
-
-  for (const line of grid) {
-    const pixels = Buffer.alloc(side * 4, 0xff);
-    let at = quiet * scale;
-    for (let x = 0; x < size; x++) {
-      if (line[x]) for (let i = 0; i < scale; i++) pixels.fill(0, (at + i) * 4, (at + i) * 4 + 3);
-      at += scale;
-    }
-    for (let i = 0; i < scale; i++) rows.push(pixels);
-  }
-  for (let i = 0; i < quiet * scale; i++) rows.push(row);
-
+/** Ảnh RGBA8 thô thành PNG. */
+function pngFromPixels(width, height, pixels) {
   const header = Buffer.alloc(13);
-  header.writeUInt32BE(side, 0);
-  header.writeUInt32BE(side, 4);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
   header[8] = 8;    // 8 bit một kênh
   header[9] = 6;    // RGBA
-  const raw = Buffer.concat(rows.map((pixels) => Buffer.concat([Buffer.from([0]), pixels])));
+  const stride = width * 4;
+  const rows = [];
+  for (let y = 0; y < height; y++) {
+    rows.push(Buffer.from([0]), pixels.subarray(y * stride, (y + 1) * stride));   // 0 = không lọc
+  }
 
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     pngChunk('IHDR', header),
-    pngChunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
+    pngChunk('IDAT', zlib.deflateSync(Buffer.concat(rows), { level: 9 })),
     pngChunk('IEND', Buffer.alloc(0)),
   ]);
 }
 
-/**
- * Ghép nền của VietQR với lưới mã thành một tấm SVG sạch.
- *
- * Lưới được vẽ thẳng bằng toạ độ tuyệt đối, không dùng `<g transform>`: transform là thứ duy nhất
- * có mặt trong tấm SVG gốc mà tấm dựng lại không có, nên nó là nghi phạm đầu tiên cho việc mã không
- * hiện. Bỏ nó đi thì không còn gì để đoán.
- */
-export function composeQrSvg(parsed) {
-  const { size, grid, scale, at, background, backgroundSize } = parsed;
-  const pad = parsed.quiet * scale;
-  // Khổ tấm card lấy theo nền, không theo lưới mã: nền mới là cả tấm, mã chỉ nằm trong ấy.
-  const width = backgroundSize?.width || pad * 2 + size * scale;
-  const height = backgroundSize?.height || pad * 2 + size * scale;
+const PAETH = (a, b, c) => {
+  const p = a + b - c;
+  const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+  return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+};
 
-  const runs = [];
+/**
+ * PNG tám bit, không đan xen, hệ màu xám / RGB / RGBA → ảnh RGBA8 thô.
+ *
+ * Chỉ đủ để đọc tấm nền của VietQR — không phải một bộ giải PNG nói chung. Gặp thứ nằm ngoài hiểu
+ * biết ấy thì trả null, và người gọi lùi về đường khác, chứ không đoán bừa ra một tấm ảnh sai.
+ */
+export function decodePng(bytes) {
+  const data = Buffer.from(bytes);
+  if (data.length < 8 || !data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return null;
+
+  let at = 8;
+  let header = null;
+  const idat = [];
+  while (at + 12 <= data.length) {
+    const length = data.readUInt32BE(at);
+    const type = data.toString('latin1', at + 4, at + 8);
+    if (type === 'IHDR') header = data.subarray(at + 8, at + 8 + length);
+    else if (type === 'IDAT') idat.push(data.subarray(at + 8, at + 8 + length));
+    else if (type === 'IEND') break;
+    at += 12 + length;
+  }
+  if (!header || !idat.length) return null;
+
+  const width = header.readUInt32BE(0);
+  const height = header.readUInt32BE(4);
+  const depth = header[8];
+  const colorType = header[9];
+  const interlace = header[12];
+  const channels = { 0: 1, 2: 3, 6: 4 }[colorType];
+  if (depth !== 8 || !channels || interlace !== 0 || !width || !height) return null;
+
+  let raw;
+  try { raw = zlib.inflateSync(Buffer.concat(idat)); } catch { return null; }
+
+  const stride = width * channels;
+  if (raw.length < height * (stride + 1)) return null;
+
+  const pixels = Buffer.alloc(width * height * 4, 0xff);
+  const line = Buffer.alloc(stride);
+  const prev = Buffer.alloc(stride);
+  let cursor = 0;
+  for (let y = 0; y < height; y++) {
+    const filter = raw[cursor++];
+    for (let i = 0; i < stride; i++) {
+      const value = raw[cursor + i];
+      const a = i >= channels ? line[i - channels] : 0;
+      const b = prev[i];
+      const c = i >= channels ? prev[i - channels] : 0;
+      line[i] = (
+        filter === 0 ? value
+          : filter === 1 ? value + a
+            : filter === 2 ? value + b
+              : filter === 3 ? value + ((a + b) >> 1)
+                : filter === 4 ? value + PAETH(a, b, c)
+                  : value
+      ) & 0xff;
+    }
+    cursor += stride;
+
+    for (let x = 0; x < width; x++) {
+      const from = x * channels;
+      const to = (y * width + x) * 4;
+      if (channels === 1) { pixels[to] = line[from]; pixels[to + 1] = line[from]; pixels[to + 2] = line[from]; }
+      else { pixels[to] = line[from]; pixels[to + 1] = line[from + 1]; pixels[to + 2] = line[from + 2]; }
+      pixels[to + 3] = channels === 4 ? line[from + 3] : 0xff;
+    }
+    prev.set(line);
+  }
+  return { width, height, pixels };
+}
+
+function paintRect(pixels, width, height, x0, y0, w, h) {
+  const left = Math.max(0, Math.round(x0));
+  const top = Math.max(0, Math.round(y0));
+  const right = Math.min(width, Math.round(x0 + w));
+  const bottom = Math.min(height, Math.round(y0 + h));
+  for (let y = top; y < bottom; y++) {
+    for (let x = left; x < right; x++) pixels.fill(0, (y * width + x) * 4, (y * width + x) * 4 + 3);
+  }
+}
+
+/**
+ * Tấm card thành PNG: nền của VietQR, rồi mã vẽ đè lên đúng chỗ nền chừa sẵn.
+ *
+ * Đây là đường duy nhất có cả khung lẫn mã.
+ *
+ * Nền nằm trong một thẻ `<image href="data:...">` của SVG, mà bộ vẽ SVG của nền tảng **không vẽ thẻ
+ * ấy** — gửi SVG thì ra mỗi mã trơ trên nền trắng, khung và logo biến mất. Ảnh raster thì nó vẽ
+ * được: tấm PNG chỉ có nền (chưa ghép gì) đã hiện đủ khung, logo, số tài khoản. Nên ở đây giải tấm
+ * nền ra, vẽ mã lên, rồi trả về một tấm PNG — raster thì không có thẻ nào để mà bỏ qua.
+ */
+export function composeCardPng(parsed) {
+  if (!parsed.background?.startsWith('data:image/png;base64,')) return null;
+  const background = decodePng(Buffer.from(parsed.background.slice('data:image/png;base64,'.length), 'base64'));
+  if (!background) return null;
+
+  const { width, height } = background;
+  const pixels = Buffer.from(background.pixels);
+  const { size, grid, scale, at } = parsed;
   for (let y = 0; y < size; y++) {
-    let x = 0;
-    while (x < size) {
-      if (!grid[y][x]) { x++; continue; }
-      let width_ = 1;
-      while (x + width_ < size && grid[y][x + width_]) width_++;
-      const span = (width_ * scale).toFixed(2);
-      const px = (at.x + x * scale).toFixed(2);
-      const py = (at.y + y * scale).toFixed(2);
-      runs.push(`M${px} ${py}h${span}v${scale}h-${span}z`);
-      x += width_;
+    for (let x = 0; x < size; x++) {
+      if (grid[y][x]) paintRect(pixels, width, height, at.x + x * scale, at.y + y * scale, scale, scale);
     }
   }
+  return pngFromPixels(width, height, pixels);
+}
 
-  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + ' ' + height + '"'
-    + ' width="' + width + '" height="' + height + '" shape-rendering="crispEdges">'
-    + (background ? `<image x="0" y="0" width="${width}" height="${height}" href="${background}"/>` : '')
-    // Không có ô trắng nào dưới mã.
-    //
-    // Nền đã chừa sẵn đúng khoảng trống ấy — mã khớp khít vào đó, không đè lên header, số tài khoản
-    // hay tên. Thêm một ô trắng chỉ để che mất dòng "Số tài khoản" mà nền vốn đã vẽ.
-    + '<path fill="#000000" d="' + runs.join('') + '"/></svg>';
+/**
+ * Lưới module thành PNG, mỗi module `scale` điểm ảnh, viền trắng `quiet` module.
+ *
+ * Ghi ra **RGBA**, không phải thang xám: đen trắng thì thang xám là lẽ tự nhiên, nhưng bốn kênh là
+ * thứ mọi đường xử lý ảnh đều chắc chắn đọc được.
+ */
+export function qrPng(grid, { scale = 8, quiet = 4 } = {}) {
+  const size = grid.length;
+  const side = (size + quiet * 2) * scale;
+  const pixels = Buffer.alloc(side * side * 4, 0xff);
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (grid[y][x]) paintRect(pixels, side, side, (quiet + x) * scale, (quiet + y) * scale, scale, scale);
+    }
+  }
+  return pngFromPixels(side, side, pixels);
 }
 
 /**
@@ -825,24 +897,25 @@ export async function fetchQr(account, { amount = null, description = '' } = {},
   if (!parsed) return { link, images: [], status: response.status, reason: 'unreadable_qr' };
 
   const name = `vietqr-${account.accountNo}`;
-  // Bốn ứng viên, thử lần lượt cho tới khi một cái đi được.
+  // Tấm card PNG đứng đầu, và đó là thứ duy nhất có cả khung lẫn mã.
   //
-  // 1. Tấm nguyên bản của VietQR. Chưa từng thử gửi lần nào, nhưng nó hợp lệ theo đúng luật máy chủ
-  //    ghi: có thẻ `svg`, không script, không foreignObject, không handler, không link ngoài (mọi
-  //    `href` đều là `data:`). Nếu máy chủ nhận thì đây là tấm đẹp nhất — không có gì phải dựng lại.
-  // 2. Tấm ghép: đúng nội dung ấy, vẽ lại bằng toạ độ tuyệt đối, không `transform`. Dành cho trường
-  //    hợp máy chủ nhận tấm 1 nhưng bộ lọc của nó bỏ `<g transform>` — khi ấy mã sẽ nằm sai chỗ.
-  // 3. SVG trơ: chỉ mã, không nền.
-  // 4. PNG.
-  const images = [
-    { fileName: `${name}.svg`, contentType: 'image/svg+xml', svg: body },
-    { fileName: `${name}-composed.svg`, contentType: 'image/svg+xml', svg: composeQrSvg(parsed) },
-    { fileName: `${name}-qr.svg`, contentType: 'image/svg+xml', svg: qrSvg(parsed.grid) },
-  ];
+  // Bộ vẽ SVG của nền tảng không vẽ thẻ `<image href="data:...">`, mà nền — khung, logo, số tài
+  // khoản — nằm đúng trong thẻ ấy. Nên mọi đường SVG đều ra mã trơ trên nền trắng; người dùng đã
+  // thấy tận mắt hai lần. PNG thì vẽ được: tấm chỉ có nền đã hiện đủ khung. Vậy nền và mã phải gặp
+  // nhau trong một tấm raster, vì raster không có thẻ nào để bộ vẽ bỏ qua.
+  const images = [];
+  const card = composeCardPng(parsed);
+  if (card) {
+    images.push({ fileName: `${name}.png`, contentType: 'image/png', dataBase64: card.toString('base64') });
+  }
+
   const png = qrPng(parsed.grid);
   if (png.length <= MOST_IMAGE_BYTES) {
-    images.push({ fileName: `${name}.png`, contentType: 'image/png', dataBase64: png.toString('base64') });
+    images.push({ fileName: `${name}-qr.png`, contentType: 'image/png', dataBase64: png.toString('base64') });
   }
+
+  // Đường lùi cuối: SVG. Chỉ ra mã trơ, nhưng vẫn quét được nếu máy chủ không chịu PNG nào.
+  images.push({ fileName: `${name}-qr.svg`, contentType: 'image/svg+xml', svg: qrSvg(parsed.grid) });
 
   return { link, images, status: response.status, version: parsed.version };
 }
