@@ -593,16 +593,36 @@ export function parseRegister(text, me) {
 }
 
 /** `gen-qr [số tiền] [nội dung]` — không có số tiền thì mã vẫn dựng, chỉ là để trống. */
+/** `qr-list` — ai đã đăng ký tài khoản với bot. */
+export function parseRoster(text, me) {
+  return /^qr-?list$/i.test(stripBotMention(text, me));
+}
+
+/**
+ * `gen-qr [@người] [số tiền] [nội dung]`.
+ *
+ * `@người` đứng trước, và có thể thiếu: không có thì hỏi mã của chính người gõ. Đặt trước số tiền
+ * chứ không phải sau, vì nội dung là phần đuôi tự do — `gen-qr 100k @hieu tra tien` sẽ khó nói
+ * `@hieu` là người hay là một phần của nội dung.
+ */
 export function parseQrRequest(text, me) {
   const match = /^gen-?qr(?:\s+([\s\S]+))?$/i.exec(stripBotMention(text, me));
   if (!match) return null;
-  const rest = (match[1] ?? '').trim();
-  if (!rest) return { amount: null, description: '' };
+
+  let rest = (match[1] ?? '').trim();
+  let handle = null;
+  const who = /^@(\S+)\s*/.exec(rest);
+  if (who) {
+    handle = who[1];
+    rest = rest.slice(who[0].length).trim();
+  }
+
+  if (!rest) return { handle, amount: null, description: '' };
 
   const [first, ...tail] = rest.split(/\s+/);
   const amount = parseAmount(first);
-  if (amount === null) return { amount: null, description: cleanDescription(rest), unreadable: first };
-  return { amount, description: cleanDescription(tail.join(' ')) };
+  if (amount === null) return { handle, amount: null, description: cleanDescription(rest), unreadable: first };
+  return { handle, amount, description: cleanDescription(tail.join(' ')) };
 }
 
 /** Đường link Quick Link của một tài khoản. */
@@ -1058,16 +1078,86 @@ export async function fetchQr(account, { amount = null, description = '' } = {},
   return { link, images, status: response.status, version: parsed.version };
 }
 
+/** Tên để gọi một người trong nhóm: ưu tiên handle vì nó ngắn và gõ lại được. */
+export function accountLabel(account) {
+  return account?.username ? `@${account.username}` : (account?.displayName || 'ai đó');
+}
+
+/**
+ * Khoá để so tên: bỏ dấu, bỏ khoảng cách, bỏ `@`, viết thường.
+ *
+ * Bỏ dấu vì người ta gõ `@hieu` chứ ít khi gõ `@Hiếu`, còn tên hiển thị thì hay có dấu.
+ */
+function foldForMatch(value) {
+  return String(value ?? '')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/đ/gi, 'd')
+    .toLowerCase()
+    .replace(/^@/, '')
+    .replace(/\s+/g, '');
+}
+
+/**
+ * Tìm tài khoản đã đăng ký theo tên người gõ.
+ *
+ * Khớp handle trước, rồi tới tên hiển thị — cả hai đều là chữ người ta gõ được, còn `userId` thì
+ * không. Handle đứng trước vì nó không dấu và không dấu cách, nên nó đỡ nhập nhằng hơn.
+ */
+export function findAccount(accounts, query, me) {
+  const wanted = foldForMatch(query);
+  if (!wanted) return { account: null, reason: 'empty' };
+
+  const mine = [me?.username, me?.displayName].map(foldForMatch).filter(Boolean);
+  if (mine.includes(wanted)) return { account: null, reason: 'self' };
+
+  const all = Object.values(accounts ?? {});
+  const byHandle = all.find((entry) => foldForMatch(entry.username) === wanted);
+  if (byHandle) return { account: byHandle, reason: 'found' };
+
+  const byName = all.find((entry) => foldForMatch(entry.displayName) === wanted);
+  if (byName) return { account: byName, reason: 'found' };
+
+  return { account: null, reason: 'unknown' };
+}
+
+/** Danh sách người đã đăng ký, để người gõ khỏi phải mò tên. */
+export function accountRoster(accounts) {
+  const all = Object.values(accounts ?? {});
+  if (!all.length) return 'Chưa ai đăng ký tài khoản nhận tiền.';
+  const lines = all.map((entry) => {
+    const label = accountLabel(entry);
+    const name = entry.displayName || entry.name || '';
+    // Tên hiển thị trùng tên chủ tài khoản thì nói một lần thôi.
+    const shown = name && foldForMatch(name) !== foldForMatch(label) ? ` (${name})` : '';
+    return `${label}${shown} — ${entry.bankLabel} ${entry.accountNo}`;
+  });
+  return `Đã đăng ký:\n${lines.join('\n')}`;
+}
+
+/**
+ * Dòng nhắc kiểm tra, và đây là phần không được bỏ.
+ *
+ * Số tài khoản do người ta tự gõ vào, nên bot không có cách nào biết nó có đúng là của họ hay
+ * không — tra được tên trong danh sách chỉ nghĩa là *có người tên ấy đã lưu một số tài khoản*, chứ
+ * không nói gì về việc số ấy có phải của họ. Chuyển tiền vào một số gõ nhầm thì không lấy lại được,
+ * nên chỗ duy nhất chặn được là người chuyển, trước khi bấm.
+ */
+export const VERIFY_NOTE = 'Chưa chắc đúng người và đúng số tài khoản — người nhận tự gõ số khi đăng ký. '
+  + 'Đối chiếu tên và số tài khoản trước khi chuyển.';
+
 /**
  * Chữ đi kèm ảnh QR — số tiền và nội dung phải đọc được cả khi không mở ảnh.
  *
  * Không kèm link: link là thứ chỉ có ích khi ảnh không hiện, mà lúc ấy người ta cần biết bot đã hỏi
  * VietQR cái gì hơn là một URL dài. Link vẫn được ghi vào log máy chủ để tra khi có chuyện.
  */
-export function qrCaption(account, amount, description) {
-  const lines = [`QR chuyển tiền — ${account.bankLabel} ${account.accountNo}`, account.name];
+export function qrCaption(account, amount, description, { payee = null, note = null } = {}) {
+  const lines = [`QR chuyển tiền — ${account.bankLabel} ${account.accountNo}`];
+  lines.push(payee ? `${account.name} (của ${payee})` : account.name);
   lines.push(amount === null ? 'Số tiền: để trống, người chuyển tự nhập' : `Số tiền: ${formatMoney(amount)}đ`);
   if (description) lines.push(`Nội dung: ${description}`);
+  if (note) lines.push('', note);
   return lines.join('\n');
 }
 
@@ -1087,10 +1177,14 @@ const HELP_TEXT = `Cú pháp tính toán:
 @mathtanbot register <ngân hàng> <số tài khoản> <tên chủ tài khoản>
 Ví dụ: @mathtanbot register timo 0905473034 nguyen tan hieu
 
-Xem mã QR chuyển tiền của chính mình:
+Xem mã QR chuyển tiền — của mình, hoặc của người khác đã đăng ký:
 @mathtanbot gen-qr <số tiền> <nội dung>
+@mathtanbot gen-qr @người <số tiền> <nội dung>
 Ví dụ: @mathtanbot gen-qr 100k tra tien an trua
+       @mathtanbot gen-qr @hieu 100k tra tien an
 Số tiền hiểu được: 100000, 100.000, 100k, 1,5tr, 2 triệu.
+
+Ai đã đăng ký tài khoản: @mathtanbot qr-list
 
 Cú pháp tính phiên vebo/dallas (tự động lấy giá hiện tại):
 @mathtanbot <mã> vebo <giá_mục_tiêu> [sàn]
@@ -1234,7 +1328,15 @@ export async function run(token, {
       return;
     }
 
-    const account = { bankId: bank.bankId, bankLabel: bank.label, accountNo, name: registration.name };
+    const account = {
+      bankId: bank.bankId,
+      bankLabel: bank.label,
+      accountNo,
+      name: registration.name,
+      // Giữ lại tên để `gen-qr @người` tra được: handle có thể đổi, và `userId` thì không ai gõ được.
+      username: message.from?.username ?? null,
+      displayName: message.from?.displayName ?? null,
+    };
     accounts[userId] = account;
     saveState(statePath, { offset, accounts });
 
@@ -1258,10 +1360,36 @@ export async function run(token, {
     await say(message.conversationId, confirmed, message.messageId, { images: card.images });
   }
 
-  /** Mã QR chuyển tiền của người đang gõ. */
+  /**
+   * Mã QR chuyển tiền — của chính người gõ, hoặc của người được nhắc tới.
+   *
+   * `@người` có thì tra trong danh sách đã đăng ký; không có thì lấy tài khoản của người gõ. Dù
+   * đường nào, dòng nhắc kiểm tra vẫn đi kèm: bot tra được *có người tên ấy đã lưu một số tài
+   * khoản*, chứ không biết số ấy có đúng của họ hay không.
+   */
   async function onGenQr(message, asked) {
     const userId = message.from?.userId;
-    const account = userId ? accounts[userId] : null;
+    let account = userId ? accounts[userId] : null;
+    let payee = null;
+
+    if (asked.handle) {
+      const found = findAccount(accounts, asked.handle, me);
+      if (found.reason === 'self') {
+        // `gen-qr @chính-mình` cũng như `gen-qr` — không cần nói gì thêm.
+      } else if (found.reason === 'found') {
+        account = found.account;
+        payee = accountLabel(found.account);
+      } else {
+        const hint = Object.keys(accounts).length ? `\n${accountRoster(accounts)}` : `\n${usageRegister(me.username)}`;
+        await say(
+          message.conversationId,
+          `Không ai tên "@${asked.handle}" đã đăng ký tài khoản với bot.${hint}`,
+          message.messageId,
+        );
+        return;
+      }
+    }
+
     if (!account) {
       await say(message.conversationId, `Bạn chưa đăng ký tài khoản nhận tiền.\n${usageRegister(me.username)}`, message.messageId);
       return;
@@ -1287,8 +1415,8 @@ export async function run(token, {
       );
     }
 
-    const caption = qrCaption(account, asked.amount, asked.description);
-    console.log(`    -> gen-qr ${account.bankLabel} ${account.accountNo} amount=${asked.amount}`);
+    const caption = qrCaption(account, asked.amount, asked.description, { payee, note: VERIFY_NOTE });
+    console.log(`    -> gen-qr ${account.bankLabel} ${account.accountNo} amount=${asked.amount}${payee ? ` payee=${payee}` : ''}`);
     console.log(`       ${card.link}`);
 
     if (card.images.length) {
@@ -1319,7 +1447,13 @@ export async function run(token, {
       return;
     }
 
-    // Mã QR chuyển tiền của người đang gõ
+    // Ai đã đăng ký tài khoản
+    if (parseRoster(message.text ?? '', me)) {
+      await say(message.conversationId, accountRoster(accounts), message.messageId);
+      return;
+    }
+
+    // Mã QR chuyển tiền — của mình hoặc của người khác
     const askedQr = parseQrRequest(message.text ?? '', me);
     if (askedQr) {
       await onGenQr(message, askedQr);

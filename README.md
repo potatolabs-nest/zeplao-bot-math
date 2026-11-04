@@ -19,6 +19,8 @@ A math calculator bot for group chat, with bank QR codes. Mention `@mathtanbot` 
 | `@mathtanbot 1.5 + 2.5` | Số thập phân |
 | `@mathtanbot register timo 0905473034 nguyen tan hieu` | Lưu tài khoản nhận tiền của bạn |
 | `@mathtanbot gen-qr 100k tra tien an trua` | Mã QR chuyển tiền của chính bạn |
+| `@mathtanbot gen-qr @hieu 100k tra tien an` | Mã QR của người khác, nếu họ đã đăng ký |
+| `@mathtanbot qr-list` | Ai đã đăng ký tài khoản |
 
 Bot chỉ phản hồi khi được **mention** (`@mathtanbot`). Tin nhắn không mention sẽ bị bỏ qua.
 
@@ -36,21 +38,32 @@ khoản có đúng không, và link thì nói ra sai ở đâu khi mã không d�
   [mã QR]
 ```
 
-`gen-qr` lấy tài khoản của **người đang gõ**, không phải của người được nhắc:
+`gen-qr` lấy tài khoản của **người gõ**, hoặc của người được nhắc nếu có `@người` đứng trước số
+tiền. `@người` đứng trước chứ không phải sau, vì nội dung là phần đuôi tự do — `gen-qr 100k @hieu
+tra tien` sẽ khó nói `@hieu` là người nhận hay là một phần của nội dung. Tra người theo handle
+(`@hieu`, không phân biệt hoa thường, bỏ dấu) rồi tới tên hiển thị (`an nguyen`, `An Nguyễn` đều
+được). `qr-list` cho biết ai đã đăng ký.
 
 ```
-@mathtanbot gen-qr 100k tra tien an trua
+@mathtanbot gen-qr @hieu 100k tra tien an trua
 → QR chuyển tiền — Timo 0905473034
-  nguyen tan hieu
+  NGUYEN TAN HIEU (của @hieu)
   Số tiền: 100.000đ
   Nội dung: tra tien an trua
-  https://img.vietqr.io/image/963388-0905473034-compact2.svg?amount=100000&addInfo=tra+tien+an+trua...
+
+  Chưa chắc đúng người và đúng số tài khoản — người nhận tự gõ số khi đăng ký.
+  Đối chiếu tên và số tài khoản trước khi chuyển.
   [mã QR]
 ```
 
 Số tiền hiểu được: `100000`, `100.000`, `100k`, `1,5tr`, `2 triệu`. Gõ số tiền mà bot không đọc ra
 thì nó nói thẳng và dựng mã để trống tiền, chứ không lặng lẽ bỏ đi. Bỏ số tiền cũng được — mã vẫn
 dựng, người chuyển tự nhập.
+
+**Dòng nhắc kiểm tra không bao giờ bị bỏ.** Số tài khoản do người ta tự gõ, nên bot không có cách
+nào biết nó có đúng là của họ: tra ra tên trong danh sách chỉ nghĩa là *có người tên ấy đã lưu một
+số tài khoản*, chứ không nói gì về việc số ấy có phải của họ. Chuyển nhầm thì không lấy lại được,
+nên chỗ duy nhất chặn được là người chuyển, trước khi bấm.
 
 Ảnh do người dùng gửi **không tới được bot** (`messageType` chỉ có `text` và `sticker`), nên không
 có cách nào đọc mã QR ai đó gửi lên. Đổi lại, `register` trả về ngay mã của tài khoản vừa lưu.

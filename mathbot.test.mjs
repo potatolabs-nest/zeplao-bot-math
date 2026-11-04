@@ -13,6 +13,7 @@ import {
   parseRegister, parseQrRequest, parseAmount, cleanDescription, formatMoney,
   stripBotMention, lookupBank, bankDirectory, parseQrSvg, composeCardPng, decodePng,
   qrPng, qrSvg, qrLink, qrCaption, fetchQr, asciiFold, drawText,
+  parseRoster, findAccount, accountLabel, accountRoster, VERIFY_NOTE,
 } from './mathbot.mjs';
 
 const ME = { username: 'mathtanbot', displayName: 'mathbot' };
@@ -546,15 +547,99 @@ test('parseRegister: thiếu tên thì không phải lệnh', () => {
 });
 
 test('parseQrRequest: số tiền và nội dung', () => {
-  assert.deepEqual(parseQrRequest('gen-qr 100000 tra tien an', ME), { amount: 100000, description: 'tra tien an' });
+  assert.deepEqual(parseQrRequest('gen-qr 100000 tra tien an', ME), { handle: null, amount: 100000, description: 'tra tien an' });
 });
 
 test('parseQrRequest: không có gì thì mã vẫn dựng, để trống tiền', () => {
-  assert.deepEqual(parseQrRequest('gen-qr', ME), { amount: null, description: '' });
+  assert.deepEqual(parseQrRequest('gen-qr', ME), { handle: null, amount: null, description: '' });
 });
 
 test('parseQrRequest: chỉ có nội dung', () => {
-  assert.deepEqual(parseQrRequest('gen-qr tra tien an', ME), { amount: null, description: 'tra tien an', unreadable: 'tra' });
+  assert.deepEqual(parseQrRequest('gen-qr tra tien an', ME), { handle: null, amount: null, description: 'tra tien an', unreadable: 'tra' });
+});
+
+test('parseQrRequest: @người đứng trước số tiền', () => {
+  assert.deepEqual(parseQrRequest('gen-qr @hieu 100k tra tien an', ME), { handle: 'hieu', amount: 100000, description: 'tra tien an' });
+});
+
+test('parseQrRequest: chỉ @người, không tiền không nội dung', () => {
+  assert.deepEqual(parseQrRequest('gen-qr @hieu', ME), { handle: 'hieu', amount: null, description: '' });
+});
+
+test('parseQrRequest: @người kèm nội dung mà không có tiền', () => {
+  assert.deepEqual(parseQrRequest('gen-qr @hieu tra tien', ME), {
+    handle: 'hieu', amount: null, description: 'tra tien', unreadable: 'tra',
+  });
+});
+
+test('parseQrRequest: mention của bot không bị nhầm thành người nhận', () => {
+  // `@mathtanbot` bị bóc trước, nên `@hieu` mới là người nhận.
+  assert.deepEqual(parseQrRequest('@mathtanbot gen-qr @hieu 50k tien an', ME), {
+    handle: 'hieu', amount: 50000, description: 'tien an',
+  });
+});
+
+test('parseRoster: qr-list và qrlist', () => {
+  assert.ok(parseRoster('qr-list', ME));
+  assert.ok(parseRoster('qrlist', ME));
+  assert.ok(parseRoster('@mathtanbot qr-list', ME));
+  assert.ok(!parseRoster('qr 1', ME));
+  assert.ok(!parseRoster('gen-qr', ME));
+  assert.ok(!parseRoster('register timo 1 x', ME));
+});
+
+// ---- tra người đã đăng ký ----------------------------------------------------------------------
+
+const HIEU = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'NGUYEN TAN HIEU', username: 'hieu', displayName: 'Hiếu' };
+const AN = { bankId: '970436', bankLabel: 'Vietcombank', accountNo: '1234567890', name: 'TRAN VAN AN', username: null, displayName: 'An Nguyễn' };
+const BOOK = { u1: HIEU, u2: AN };
+
+test('findAccount: tra theo handle', () => {
+  assert.equal(findAccount(BOOK, 'hieu', ME).account, HIEU);
+  assert.equal(findAccount(BOOK, '@hieu', ME).account, HIEU);
+  assert.equal(findAccount(BOOK, 'HIEU', ME).account, HIEU);
+});
+
+test('findAccount: tra theo tên hiển thị, kể cả khi đã bỏ dấu', () => {
+  assert.equal(findAccount(BOOK, 'hieu', ME).account, HIEU);
+  assert.equal(findAccount(BOOK, 'an nguyen', ME).account, AN);
+  assert.equal(findAccount(BOOK, 'annguyen', ME).account, AN);
+});
+
+test('findAccount: người lạ thì không tra ra, và nói rõ vì sao', () => {
+  assert.equal(findAccount(BOOK, 'khongcoai', ME).reason, 'unknown');
+  assert.equal(findAccount(BOOK, '', ME).reason, 'empty');
+  assert.equal(findAccount({}, 'hieu', ME).reason, 'unknown');
+});
+
+test('findAccount: nhắc chính bot thì là self, không phải người nhận', () => {
+  assert.equal(findAccount(BOOK, 'mathtanbot', ME).reason, 'self');
+});
+
+test('accountLabel: ưu tiên handle, không có thì tên hiển thị', () => {
+  assert.equal(accountLabel(HIEU), '@hieu');
+  assert.equal(accountLabel(AN), 'An Nguyễn');
+});
+
+test('accountRoster: liệt kê người và tài khoản', () => {
+  const list = accountRoster(BOOK);
+  assert.match(list, /@hieu/);
+  assert.match(list, /Timo 0905473034/);
+  assert.match(list, /An Nguyễn/);
+  assert.match(list, /Vietcombank 1234567890/);
+  assert.match(accountRoster({}), /Chưa ai đăng ký/);
+});
+
+test('qrCaption: nói rõ mã của ai, và luôn kèm dòng nhắc kiểm tra', () => {
+  const caption = qrCaption(HIEU, 100000, 'tra tien an', { payee: '@hieu', note: VERIFY_NOTE });
+  assert.match(caption, /Timo 0905473034/);
+  assert.match(caption, /NGUYEN TAN HIEU \(của @hieu\)/);
+  assert.match(caption, /Số tiền: 100\.000đ/);
+  assert.match(caption, /Chưa chắc đúng người và đúng số tài khoản/);
+  // Mã của chính mình thì không có "(của ...)" nhưng vẫn có dòng nhắc.
+  const own = qrCaption(HIEU, null, '', { note: VERIFY_NOTE });
+  assert.doesNotMatch(own, /\(của /);
+  assert.match(own, /Chưa chắc đúng người/);
 });
 
 test('parseAmount: các kiểu người Việt gõ', () => {
@@ -895,6 +980,59 @@ test('gen-qr: máy chủ không chịu PNG thì SVG trơ đi thay', async () => 
   assert.equal(result.sent[1].image.fileName, 'vietqr-0905473034-qr.svg');
   assert.equal(result.sent[1].image.contentType, 'image/svg+xml');
   assert.match(result.sent[1].text, /Số tiền: 100\.000đ/);
+});
+
+test('gen-qr: xem mã của người khác đã đăng ký', async () => {
+  const { sent } = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1', username: 'hieu' } }, 1),
+    update({ text: '@mathtanbot register vcb 1234567890 an', from: { userId: 'u2', username: 'an' } }, 2),
+    update({ text: '@mathtanbot gen-qr @an 100k tra tien an trua', from: { userId: 'u1' } }, 3),
+  ], { expect: 3, qrBankIds: ['963388', '970436'] });
+  assert.equal(sent.length, 3);
+  const qr = sent[2];
+  assert.match(qr.text, /QR chuyển tiền — Vietcombank 1234567890/, 'phải là tài khoản của người được nhắc');
+  assert.match(qr.text, /của @an/);
+  assert.match(qr.text, /Số tiền: 100\.000đ/);
+  assert.match(qr.text, /Nội dung: tra tien an trua/);
+  assert.match(qr.text, /Chưa chắc đúng người và đúng số tài khoản/, 'phải kèm dòng nhắc kiểm tra');
+  assert.equal(qr.image.contentType, 'image/png');
+});
+
+test('gen-qr: người được nhắc chưa đăng ký thì liệt kê ai đã đăng ký', async () => {
+  const { sent } = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1', username: 'hieu' } }, 1),
+    update({ text: '@mathtanbot gen-qr @khongcoai 100k', from: { userId: 'u1' } }, 2),
+  ], { expect: 2 });
+  assert.match(sent[1].text, /Không ai tên "@khongcoai"/);
+  assert.match(sent[1].text, /Đã đăng ký:/);
+  assert.match(sent[1].text, /@hieu/);
+});
+
+test('gen-qr: mã của chính mình vẫn kèm dòng nhắc kiểm tra', async () => {
+  const { sent } = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1', username: 'hieu' } }, 1),
+    update({ text: '@mathtanbot gen-qr 100k tra tien', from: { userId: 'u1' } }, 2),
+  ], { expect: 2 });
+  assert.match(sent[1].text, /Chưa chắc đúng người và đúng số tài khoản/);
+  assert.doesNotMatch(sent[1].text, /\(của /, 'mã của mình thì không nói "của ai"');
+});
+
+test('qr-list: liệt kê người đã đăng ký', async () => {
+  const { sent } = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1', username: 'hieu' } }, 1),
+    update({ text: '@mathtanbot register vcb 1234567890 an', from: { userId: 'u2', displayName: 'An Nguyễn' } }, 2),
+    update({ text: '@mathtanbot qr-list', from: { userId: 'u1' } }, 3),
+  ], { expect: 3, qrBankIds: ['963388', '970436'] });
+  const list = sent[2].text;
+  assert.match(list, /@hieu/);
+  assert.match(list, /Timo 0905473034/);
+  assert.match(list, /An Nguyễn/);
+  assert.match(list, /Vietcombank 1234567890/);
+});
+
+test('qr-list: chưa ai đăng ký thì nói vậy', async () => {
+  const { sent } = await withBot([update({ text: '@mathtanbot qr-list', from: { userId: 'u1' } })]);
+  assert.match(sent[0].text, /Chưa ai đăng ký tài khoản/);
 });
 
 test('gen-qr: máy chủ từ chối mọi ảnh thì chữ vẫn đi', async () => {
