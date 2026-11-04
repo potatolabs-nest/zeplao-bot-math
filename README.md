@@ -57,8 +57,11 @@ có cách nào đọc mã QR ai đó gửi lên. Đổi lại, `register` trả 
 
 Mã QR lấy từ [Quick Link của VietQR](https://www.vietqr.io/qr-dong) — một URL, không cần khoá.
 VietQR trả về SVG, nhưng mã trong đó là **hình vector** nằm đè lên một tấm ảnh nền có logo ngân hàng;
-`parseQrSvg` dựng lại lưới module từ chính hình ấy rồi `qrPng` vẽ thành PNG, vì bóc tấm ảnh nền ra
-thì người nhận chỉ thấy cái khung.
+`parseQrSvg` dựng lại lưới module từ chính hình ấy, rồi `qrSvg` vẽ lại thành SVG sạch và `qrPng`
+thành PNG. Bóc tấm ảnh nền ra thì người nhận chỉ thấy cái khung.
+
+Bot gửi SVG trước, PNG sau, rồi mới tới chữ không ảnh — máy chủ từ chối kiểu nào thì kiểu kế tiếp đi
+thay. Chữ của tin có ảnh đi kèm dưới dạng `rich`, không phải `text` trần.
 
 ## Chạy
 

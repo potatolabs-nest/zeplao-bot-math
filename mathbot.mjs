@@ -668,33 +668,37 @@ function pngChunk(type, body) {
   return Buffer.concat([head, body, tail]);
 }
 
-/** Lưới module thành PNG xám, mỗi module `scale` điểm ảnh, viền trắng `quiet` module. */
+/**
+ * Lưới module thành PNG, mỗi module `scale` điểm ảnh, viền trắng `quiet` module.
+ *
+ * Ghi ra **RGBA**, không phải thang xám: đen trắng thì thang xám là lẽ tự nhiên, và đó chính là
+ * kiểu đã bị máy chủ nhận rồi mà không hiện — ảnh nào render được cũng là RGBA. Bốn kênh là thứ
+ * mọi đường xử lý ảnh đều chắc chắn đọc được, còn thang xám thì không phải đường nào cũng có.
+ */
 export function qrPng(grid, { scale = 8, quiet = 4 } = {}) {
   const size = grid.length;
   const side = (size + quiet * 2) * scale;
+  const row = Buffer.alloc(side * 4, 0xff);   // một dòng trắng, chép lại cho mọi dòng trắng
   const rows = [];
-  const blank = Buffer.alloc(side, 0xff);
-  for (let i = 0; i < quiet * scale; i++) rows.push(blank);
+  for (let i = 0; i < quiet * scale; i++) rows.push(row);
 
-  const margin = Buffer.alloc(quiet * scale, 0xff);
-  for (const row of grid) {
-    const line = Buffer.alloc(side, 0xff);
+  for (const line of grid) {
+    const pixels = Buffer.alloc(side * 4, 0xff);
     let at = quiet * scale;
     for (let x = 0; x < size; x++) {
-      if (!row[x]) { at += scale; continue; }
-      for (let i = 0; i < scale; i++) line[at + i] = 0;
+      if (line[x]) for (let i = 0; i < scale; i++) pixels.fill(0, (at + i) * 4, (at + i) * 4 + 3);
       at += scale;
     }
-    for (let i = 0; i < scale; i++) rows.push(Buffer.concat([margin, line, margin]));
+    for (let i = 0; i < scale; i++) rows.push(pixels);
   }
-  for (let i = 0; i < quiet * scale; i++) rows.push(blank);
+  for (let i = 0; i < quiet * scale; i++) rows.push(row);
 
   const header = Buffer.alloc(13);
   header.writeUInt32BE(side, 0);
   header.writeUInt32BE(side, 4);
-  header[8] = 8;    // 8 bit một điểm ảnh
-  header[9] = 0;    // thang xám
-  const raw = Buffer.concat(rows.map((row) => Buffer.concat([Buffer.from([0]), row])));
+  header[8] = 8;    // 8 bit một kênh
+  header[9] = 6;    // RGBA
+  const raw = Buffer.concat(rows.map((pixels) => Buffer.concat([Buffer.from([0]), pixels])));
 
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
@@ -705,33 +709,75 @@ export function qrPng(grid, { scale = 8, quiet = 4 } = {}) {
 }
 
 /**
+ * Cùng lưới ấy, vẽ thành SVG sạch.
+ *
+ * Nền tảng nhận hai kiểu ảnh, và kiểu SVG là kiểu đã có bằng chứng chạy được: bot chứng khoán trong
+ * nhóm gửi chart bằng SVG suốt, còn PNG thì chưa ai xác nhận. Nên đây là đường lùi khi tấm PNG bị
+ * từ chối — không phải suy đoán, mà là kiểu ảnh duy nhất biết chắc là hiện.
+ *
+ * "Sạch" ở đây đúng theo nghĩa máy chủ kiểm: chỉ `svg`, `rect`, `path`; không script, không
+ * foreignObject, không handler, không link ngoài.
+ */
+export function qrSvg(grid) {
+  const size = grid.length;
+  const runs = [];
+  for (let y = 0; y < size; y++) {
+    let x = 0;
+    while (x < size) {
+      if (!grid[y][x]) { x++; continue; }
+      let width = 1;
+      while (x + width < size && grid[y][x + width]) width++;
+      runs.push(`M${x} ${y}h${width}v1h-${width}z`);
+      x += width;
+    }
+  }
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + size + ' ' + size + '"'
+    + ' width="' + size * 8 + '" height="' + size * 8 + '" shape-rendering="crispEdges">'
+    + '<rect width="' + size + '" height="' + size + '" fill="#ffffff"/>'
+    + '<path fill="#000000" d="' + runs.join('') + '"/></svg>';
+}
+
+/**
+ * Chữ trơn thành một khối rich.
+ *
+ * Tin **có ảnh** phải đi kèm chữ dưới dạng rich, không phải `text` trần. Chữ của một tin có ảnh
+ * được client vẽ bằng markup của chính nó, và chỉ chữ trong markup ấy mới được xử lý đàng hoàng;
+ * bot chứng khoán trong nhóm gửi chart theo đúng lối này. Gửi `text` trần cạnh `image` là lối đi
+ * chưa ai chạy thử.
+ */
+function asRich(text) {
+  return { text, rich: { blocks: [{ type: 'paragraph', text }] } };
+}
+
+/**
  * Ảnh QR và đường link của nó.
  *
- * Ảnh là null khi VietQR từ chối dựng, hoặc khi câu trả lời không còn là mã dựng lại được — lúc ấy
- * link vẫn còn nguyên để gửi kèm, vì một cái link bấm được vẫn hơn một câu xin lỗi.
+ * `images` là danh sách ứng viên theo thứ tự thử, và rỗng khi VietQR từ chối dựng hoặc câu trả lời
+ * không còn là mã dựng lại được — lúc ấy `link` vẫn còn nguyên để gửi kèm, vì một cái link bấm được
+ * vẫn hơn một câu xin lỗi.
  */
 export async function fetchQr(account, { amount = null, description = '' } = {}, { image = VIETQR_IMAGE, fetchImpl = fetch } = {}) {
   const link = qrLink(account, { amount, description }, { image });
   const response = await fetchImpl(link, { signal: AbortSignal.timeout(TIMEOUT_MS) });
   const body = await response.text();
-  if (!response.ok) return { link, image: null, status: response.status };
+  if (!response.ok) return { link, images: [], status: response.status };
 
   const parsed = parseQrSvg(body);
-  if (!parsed) return { link, image: null, status: response.status, reason: 'unreadable_qr' };
+  if (!parsed) return { link, images: [], status: response.status, reason: 'unreadable_qr' };
 
+  const name = `vietqr-${account.accountNo}`;
+  // SVG đứng trước, PNG đứng sau.
+  //
+  // Không phải vì SVG đẹp hơn — vì nó là kiểu duy nhất có bằng chứng chạy được trên nền tảng này:
+  // bot chứng khoán trong nhóm gửi chart bằng SVG và hình hiện, còn tấm PNG gửi thử thì máy chủ
+  // nhận, lưu thành tệp, rồi không vẽ ra hình. PNG ở lại làm đường lùi.
+  const images = [{ fileName: `${name}.svg`, contentType: 'image/svg+xml', svg: qrSvg(parsed.grid) }];
   const png = qrPng(parsed.grid);
-  if (png.length > MOST_IMAGE_BYTES) return { link, image: null, status: response.status, reason: 'too_large' };
+  if (png.length <= MOST_IMAGE_BYTES) {
+    images.push({ fileName: `${name}.png`, contentType: 'image/png', dataBase64: png.toString('base64') });
+  }
 
-  return {
-    link,
-    image: {
-      fileName: `vietqr-${account.accountNo}.png`,
-      contentType: 'image/png',
-      dataBase64: png.toString('base64'),
-    },
-    status: response.status,
-    version: parsed.version,
-  };
+  return { link, images, status: response.status, version: parsed.version };
 }
 
 /**
@@ -922,19 +968,19 @@ export async function run(token, {
       card = await fetchQr(account, {}, { image: qrImage, fetchImpl });
     } catch (problem) {
       console.error(`    -> dựng QR xác nhận hỏng: ${problem}`);
-      card = { image: null, link: qrLink(account) };
+      card = { images: [], link: qrLink(account) };
     }
 
-    console.log(`    -> register ${bank.label} ${accountNo} ${card.image ? '(có mã xác nhận)' : '(không dựng được mã)'}`);
+    console.log(`    -> register ${bank.label} ${accountNo} ${card.images.length ? '(có mã xác nhận)' : '(không dựng được mã)'}`);
     console.log(`       ${card.link}`);
 
-    const confirmed = card.image
+    const confirmed = card.images.length
       ? `Đã lưu tài khoản nhận tiền:\n${bank.label} · ${accountNo} · ${account.name}\n\nMã dưới đây là của chính tài khoản này — sai thì gõ lại register.`
       : `Đã lưu ${bank.label} · ${accountNo} · ${account.name}, nhưng chưa dựng được mã QR để xác nhận. Kiểm lại số tài khoản nếu thấy sai.`;
 
     // Link đi kèm cả hai trường hợp: có mã thì nó là đường mở mã khi ảnh không hiện, không có mã thì
     // nó là thứ duy nhất nói ra bot vừa hỏi VietQR cái gì mà bị từ chối.
-    await say(message.conversationId, `${confirmed}\n\n${card.link}`, message.messageId, card.image ? { image: card.image } : {});
+    await say(message.conversationId, `${confirmed}\n\n${card.link}`, message.messageId, { images: card.images });
   }
 
   /** Mã QR chuyển tiền của người đang gõ. */
@@ -970,8 +1016,8 @@ export async function run(token, {
     console.log(`    -> gen-qr ${account.bankLabel} ${account.accountNo} amount=${asked.amount}`);
     console.log(`       ${card.link}`);
 
-    if (card.image) {
-      await say(message.conversationId, caption, message.messageId, { image: card.image });
+    if (card.images.length) {
+      await say(message.conversationId, caption, message.messageId, { images: card.images });
       return;
     }
 
@@ -1074,15 +1120,17 @@ export async function run(token, {
   /**
    * Nói một câu, kèm ảnh nếu có.
    *
-   * Ảnh không đi được thì chữ vẫn đi — một câu trả lời thiếu hình vẫn hơn im lặng, và người hỏi
-   * chưa biết là bot vừa hỏng.
+   * Tin có ảnh đi kèm chữ dưới dạng rich, và ảnh thử lần lượt từng ứng viên — SVG trước, PNG sau —
+   * rồi mới tới chữ không ảnh. Máy chủ từ chối vì bất cứ lý do gì thì nấc sau đi thay, và câu trả
+   * lời vẫn tới nơi: một câu trả lời thiếu hình vẫn hơn im lặng, và người hỏi chưa biết là bot hỏng.
    */
-  async function say(conversationId, text, replyToMessageId, { image } = {}) {
-    if (image) {
-      const posted = await send(conversationId, { text, image }, replyToMessageId);
+  async function say(conversationId, text, replyToMessageId, { images = [] } = {}) {
+    for (const image of images) {
+      const posted = await send(conversationId, { ...asRich(text), image }, replyToMessageId);
       if (posted) return posted;
-      console.error('    -> ảnh không gửi được, gửi lại bằng chữ');
+      console.error(`    -> ảnh ${image.contentType} không gửi được, thử kiểu kế tiếp`);
     }
+    if (images.length) console.error('    -> không gửi được ảnh nào, gửi lại bằng chữ');
     return send(conversationId, { text }, replyToMessageId);
   }
 

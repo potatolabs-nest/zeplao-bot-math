@@ -10,7 +10,7 @@ import {
   askedCalcFor, safeCalc, run, AUTHOR,
   parseStockLookup, calcCeilingSessions, calcFloorSessions, fetchPrice,
   parseRegister, parseQrRequest, parseAmount, cleanDescription, formatMoney,
-  stripBotMention, lookupBank, bankDirectory, parseQrSvg, qrPng, qrLink, qrCaption, fetchQr,
+  stripBotMention, lookupBank, bankDirectory, parseQrSvg, qrPng, qrSvg, qrLink, qrCaption, fetchQr,
 } from './mathbot.mjs';
 
 const ME = { username: 'mathtanbot', displayName: 'mathbot' };
@@ -249,7 +249,7 @@ test('null message', () => assert.equal(askedCalcFor(null, ME), null));
 
 async function stubApi(updates) {
   const sent = [];
-  const state = { refuseImages: false };
+  const state = { refuseImages: false, refuseSvg: false };
   let queue = [...updates];
   const server = createServer((request, response) => {
     let body = '';
@@ -260,8 +260,9 @@ async function stubApi(updates) {
       if (path === '/getMe') return answer(ME);
       if (path === '/sendMessage') {
         const payload = JSON.parse(body);
-        // Máy chủ từ chối tin có ảnh, đúng như lúc kho ảnh trục trặc — chữ phải đi đường riêng.
-        if (state.refuseImages && payload.image) {
+        const isSvg = payload.image?.contentType === 'image/svg+xml';
+        // `refuseImages` là kho ảnh hỏng hẳn; `refuseSvg` chỉ là không chịu SVG, để PNG đi thay.
+        if (payload.image && (state.refuseImages || (state.refuseSvg && isSvg))) {
           response.writeHead(400, { 'Content-Type': 'application/json' });
           return response.end('{"error":"bot_image_storage_unavailable"}');
         }
@@ -277,6 +278,8 @@ async function stubApi(updates) {
     sent,
     set refuseImages(value) { state.refuseImages = value; },
     get refuseImages() { return state.refuseImages; },
+    set refuseSvg(value) { state.refuseSvg = value; },
+    get refuseSvg() { return state.refuseSvg; },
     api: `http://127.0.0.1:${server.address().port}`,
     close: () => server.close(),
   };
@@ -298,8 +301,11 @@ function stubFeed(prices) {
 
 async function withBot(updates, {
   expect = 1, settle = 200, prices = {}, banks = BANKS, qrBankIds = ['963388'], qrSvg = fakeQrSvg(),
+  refuseImages = false, refuseSvg = false,
 } = {}) {
   const platform = await stubApi(updates);
+  platform.refuseImages = refuseImages;
+  platform.refuseSvg = refuseSvg;
   const feedServer = await stubFeed(prices);
   const bankServer = await stubBanks(banks);
   const qrServer = await stubVietQr({ bankIds: qrBankIds, svg: qrSvg });
@@ -564,12 +570,24 @@ test('parseQrSvg: không phải mã thì trả null', () => {
   assert.equal(parseQrSvg('<svg><g transform="translate(1 1) scale(2)"><rect width="4" height="4"/><path d="M0 0h1v1h-1z"/></g></svg>'), null);
 });
 
-test('qrPng: ra PNG thật, đúng kích thước', () => {
+test('qrPng: ra PNG thật, đúng kích thước, và là RGBA', () => {
   const { grid } = parseQrSvg(fakeQrSvg());
   const png = qrPng(grid, { scale: 4, quiet: 2 });
   assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   assert.equal(png.readUInt32BE(16), (GRID + 4) * 4);
   assert.equal(png.readUInt32BE(20), (GRID + 4) * 4);
+  // RGBA chứ không thang xám: kiểu thang xám là kiểu đã bị máy chủ nhận mà không hiện.
+  assert.equal(png[25], 6, 'colorType phải là 6 (RGBA)');
+});
+
+test('qrSvg: SVG sạch, không script, không link ngoài', () => {
+  const { grid } = parseQrSvg(fakeQrSvg());
+  const svg = qrSvg(grid);
+  assert.match(svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  assert.match(svg, /viewBox="0 0 21 21"/);
+  assert.match(svg, /<rect width="21" height="21" fill="#ffffff"\/>/);
+  assert.match(svg, /<path fill="#000000" d="M/);
+  assert.doesNotMatch(svg, /<script|<foreignObject|\son\w+=|https?:\/\/(?!www\.w3\.org)/i);
 });
 
 test('qrLink: đủ tham số khi có, chỉ còn tên chủ tài khoản khi không', () => {
@@ -595,14 +613,18 @@ test('qrCaption: luôn có link khi được đưa', () => {
   assert.match(caption, /https:\/\/img\.vietqr\.io\/image\/x\.svg/);
 });
 
-test('fetchQr: dựng lại mã từ SVG của VietQR', async () => {
+test('fetchQr: dựng lại mã, SVG trước PNG sau', async () => {
   const server = await stubVietQr();
   const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'NGUYEN TAN HIEU' };
   const card = await fetchQr(account, { amount: 100000, description: 'tra tien an' }, { image: server.image });
   assert.equal(card.status, 200);
-  assert.equal(card.image.contentType, 'image/png');
+  assert.equal(card.images.length, 2, 'SVG và PNG, để thử lần lượt');
+  assert.equal(card.images[0].contentType, 'image/svg+xml');
+  assert.match(card.images[0].svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  assert.equal(card.images[0].fileName, 'vietqr-0905473034.svg');
+  assert.equal(card.images[1].contentType, 'image/png');
   assert.equal(card.version, (GRID - 17) / 4);
-  const png = Buffer.from(card.image.dataBase64, 'base64');
+  const png = Buffer.from(card.images[1].dataBase64, 'base64');
   assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   assert.match(server.asked[0], /amount=100000/);
   server.close();
@@ -612,7 +634,7 @@ test('fetchQr: ngân hàng sai thì không có ảnh, vẫn còn link', async ()
   const server = await stubVietQr({ bankIds: ['970436'] });
   const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'X' };
   const card = await fetchQr(account, {}, { image: server.image });
-  assert.equal(card.image, null);
+  assert.deepEqual(card.images, []);
   assert.match(card.link, /963388-0905473034/);
   server.close();
 });
@@ -648,10 +670,10 @@ test('register: lưu tài khoản rồi gửi mã xác nhận', async () => {
   assert.match(sent[0].text, /Đã lưu tài khoản nhận tiền/);
   assert.match(sent[0].text, /Timo · 0905473034 · nguyen tan hieu/);
   assert.match(sent[0].text, /\/image\/963388-0905473034/, 'phải in link để nhìn ra sai ở đâu');
-  assert.equal(sent[0].image.fileName, 'vietqr-0905473034.png');
-  assert.equal(sent[0].image.contentType, 'image/png');
-  const png = Buffer.from(sent[0].image.dataBase64, 'base64');
-  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.equal(sent[0].image.fileName, 'vietqr-0905473034.svg', 'SVG đi trước vì nó là kiểu đã biết là hiện');
+  assert.equal(sent[0].image.contentType, 'image/svg+xml');
+  // Chữ của tin có ảnh phải nằm trong `rich`, không phải `text` trần — lối đi của bot chứng khoán.
+  assert.equal(sent[0].rich.blocks[0].text, sent[0].text);
   assert.equal(qrAsked.length, 1, 'VietQR chỉ bị hỏi một lần cho tấm xác nhận');
 });
 
@@ -695,7 +717,7 @@ test('gen-qr: gửi mã của chính người gõ, kèm tiền và nội dung', 
   assert.match(sent[1].text, /Số tiền: 100\.000đ/);
   assert.match(sent[1].text, /Nội dung: tra tien an trua/);
   assert.match(sent[1].text, /amount=100000/);
-  assert.equal(sent[1].image.contentType, 'image/png');
+  assert.equal(sent[1].image.contentType, 'image/svg+xml');
 });
 
 test('gen-qr: người khác không thấy mã của mình', async () => {
@@ -717,7 +739,19 @@ test('gen-qr: số tiền đọc không ra thì nói thẳng', async () => {
   assert.match(sent[2].text, /Số tiền: để trống/);
 });
 
-test('gen-qr: máy chủ từ chối ảnh thì chữ vẫn đi', async () => {
+test('gen-qr: máy chủ không chịu SVG thì PNG đi thay', async () => {
+  const result = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1' } }, 1),
+    update({ text: '@mathtanbot gen-qr 100k tra tien', from: { userId: 'u1' } }, 2),
+  ], { expect: 2, settle: 500, refuseSvg: true });
+  assert.equal(result.sent.length, 2, 'tin SVG bị từ chối, PNG đi thay');
+  assert.equal(result.sent[1].image.contentType, 'image/png');
+  const png = Buffer.from(result.sent[1].image.dataBase64, 'base64');
+  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.match(result.sent[1].text, /Số tiền: 100\.000đ/);
+});
+
+test('gen-qr: máy chủ từ chối mọi ảnh thì chữ vẫn đi', async () => {
   const platform = await stubApi([
     update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1' } }, 1),
     update({ text: '@mathtanbot gen-qr 100k tra tien', from: { userId: 'u1' } }, 2),
