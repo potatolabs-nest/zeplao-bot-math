@@ -12,7 +12,7 @@ import {
   parseStockLookup, calcCeilingSessions, calcFloorSessions, fetchPrice,
   parseRegister, parseQrRequest, parseAmount, cleanDescription, formatMoney,
   stripBotMention, lookupBank, bankDirectory, parseQrSvg, composeCardPng, decodePng,
-  qrPng, qrSvg, qrLink, qrCaption, fetchQr,
+  qrPng, qrSvg, qrLink, qrCaption, fetchQr, asciiFold, drawText,
 } from './mathbot.mjs';
 
 const ME = { username: 'mathtanbot', displayName: 'mathbot' };
@@ -654,6 +654,61 @@ test('composeCardPng: không có nền thì trả null', () => {
   assert.equal(composeCardPng({ background: null, size: 21, grid: [], scale: 6, at: { x: 0, y: 0 }, quiet: 4 }), null);
 });
 
+test('asciiFold: bỏ dấu và viết hoa, vì font không có dấu', () => {
+  assert.equal(asciiFold('Nguyễn Tấn Hiếu'), 'NGUYEN TAN HIEU');
+  assert.equal(asciiFold('Đỗ Văn Đức'), 'DO VAN DUC');
+  assert.equal(asciiFold('Số tiền: 1.500.000 VND'), 'SO TIEN: 1.500.000 VND');
+});
+
+test('drawText: chấm chữ xuất hiện đúng chỗ, căn giữa theo mốc', () => {
+  const width = 100, height = 40;
+  const pixels = Buffer.alloc(width * height * 4, 0xff);
+  drawText(pixels, width, height, 'A', { x: width / 2, y: 20, size: 8, anchor: 'middle' });
+
+  let count = 0;
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (pixels[(y * width + x) * 4] >= 128) continue;   // nền trắng, chỉ đếm chấm chữ
+      count++;
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+
+  assert.ok(count > 8, `phải vẽ ra chấm nào đó, đếm được ${count}`);
+  // Chữ 'A' rộng 5 chấm, căn giữa ở x=50 nên phải nằm quanh 47..52.
+  assert.ok(minX >= 44 && maxX <= 55, `chữ phải nằm quanh giữa, được ${minX}..${maxX}`);
+  // `y` là đường chân chữ nên nét nằm hẳn phía trên nó.
+  assert.ok(maxY <= 20 && minY >= 12, `nét phải nằm trên đường chân, được ${minY}..${maxY}`);
+});
+
+test('drawText: chữ dài thì thu nhỏ, không tràn ra ngoài', () => {
+  const width = 60, height = 30;
+  const pixels = Buffer.alloc(width * height * 4, 0xff);
+  drawText(pixels, width, height, 'MOT CHUOI RAT DAI KHONG LO VUA', { x: width / 2, y: 20, size: 16, anchor: 'middle' });
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (pixels[(y * width + x) * 4] < 128) return;   // có chữ, và chắc chắn trong khung vì vòng lặp chỉ quét trong khung
+    }
+  }
+  assert.fail('phải vẽ được gì đó');
+});
+
+test('composeCardPng: vẽ cả chữ của SVG, không chỉ mã', () => {
+  const parsed = parseQrSvg(fakeQrSvg());
+  assert.ok(parsed.texts.length >= 1, 'phải mang theo được các thẻ <text>');
+  const back = decodePng(composeCardPng(parsed));
+  // Dòng chữ trong fixture nằm quanh y=586; phải có chấm đen ở dải ấy mà nền vốn trắng.
+  let dark = 0;
+  for (let y = 574; y < 592; y++) {
+    for (let x = 0; x < back.width; x++) if (back.pixels[(y * back.width + x) * 4] < 128) dark++;
+  }
+  assert.ok(dark > 20, `phải có chữ được vẽ ở dải dưới, đếm được ${dark}`);
+});
+
 test('qrPng: ra PNG thật, đúng kích thước, và là RGBA', () => {
   const { grid } = parseQrSvg(fakeQrSvg());
   const png = qrPng(grid, { scale: 4, quiet: 2 });
@@ -688,13 +743,13 @@ test('qrLink: đủ tham số khi có, chỉ còn tên chủ tài khoản khi kh
   assert.match(bare, /accountName=NGUYEN\+TAN\+HIEU/);
 });
 
-test('qrCaption: luôn có link khi được đưa', () => {
+test('qrCaption: số tiền, nội dung, không kèm link', () => {
   const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'NGUYEN TAN HIEU' };
-  const caption = qrCaption(account, 100000, 'tra tien an', 'https://img.vietqr.io/image/x.svg');
+  const caption = qrCaption(account, 100000, 'tra tien an');
   assert.match(caption, /Timo 0905473034/);
   assert.match(caption, /Số tiền: 100\.000đ/);
   assert.match(caption, /Nội dung: tra tien an/);
-  assert.match(caption, /https:\/\/img\.vietqr\.io\/image\/x\.svg/);
+  assert.doesNotMatch(caption, /https?:/, 'không in link ra tin nhắn');
 });
 
 test('fetchQr: tấm card PNG đứng đầu, rồi mới tới các đường lùi', async () => {
@@ -759,7 +814,7 @@ test('register: lưu tài khoản rồi gửi mã xác nhận', async () => {
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /Đã lưu tài khoản nhận tiền/);
   assert.match(sent[0].text, /Timo · 0905473034 · nguyen tan hieu/);
-  assert.match(sent[0].text, /\/image\/963388-0905473034/, 'phải in link để nhìn ra sai ở đâu');
+  assert.doesNotMatch(sent[0].text, /https?:/, 'không in link ra tin nhắn');
   assert.equal(sent[0].image.fileName, 'vietqr-0905473034.png', 'tấm card PNG đi trước — có cả khung lẫn mã');
   assert.equal(sent[0].image.contentType, 'image/png');
   const card_png = Buffer.from(sent[0].image.dataBase64, 'base64');
@@ -808,7 +863,7 @@ test('gen-qr: gửi mã của chính người gõ, kèm tiền và nội dung', 
   assert.match(sent[1].text, /QR chuyển tiền — Timo 0905473034/);
   assert.match(sent[1].text, /Số tiền: 100\.000đ/);
   assert.match(sent[1].text, /Nội dung: tra tien an trua/);
-  assert.match(sent[1].text, /amount=100000/);
+  assert.doesNotMatch(sent[1].text, /https?:|amount=/, 'không in link ra tin nhắn');
   assert.equal(sent[1].image.contentType, 'image/png');
 });
 
@@ -871,5 +926,5 @@ test('gen-qr: máy chủ từ chối mọi ảnh thì chữ vẫn đi', async ()
   assert.equal(platform.sent.length, 2, 'tin có ảnh bị từ chối, chữ đi đường riêng');
   assert.equal(platform.sent[1].image, undefined);
   assert.match(platform.sent[1].text, /Số tiền: 100\.000đ/);
-  assert.match(platform.sent[1].text, /\/image\/963388-0905473034/, 'mất ảnh thì còn link');
+  assert.doesNotMatch(platform.sent[1].text, /https?:/, 'không in link ra tin nhắn');
 });

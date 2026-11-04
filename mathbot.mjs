@@ -662,6 +662,21 @@ export function parseQrSvg(svg) {
   // bộ vẽ SVG của nền tảng không vẽ được. `composeCardPng` giải nó ra để ghép mã vào.
   const image = /<image\b[^>]*\bhref="(data:image\/[\w+.-]+;base64,[^"]+)"[^>]*>/.exec(svg);
 
+  // Chữ đi kèm cũng phải mang theo: nó là `<text>` của SVG, không nằm trong ảnh nền, và nền chỉ có
+  // sẵn nhãn — chỗ điền tên, số tài khoản, số tiền đều trống.
+  const texts = [...svg.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/g)].map((match) => {
+    const attr = (name) => new RegExp(`\\b${name}\\s*=\\s*"([^"]*)"`).exec(match[1])?.[1];
+    return {
+      text: match[2].replace(/<[^>]*>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'),
+      x: Number(attr('x')) || 0,
+      y: Number(attr('y')) || 0,
+      size: Number(attr('font-size')) || 16,
+      anchor: attr('text-anchor') ?? 'start',
+      color: attr('fill'),
+      bold: attr('font-weight') === 'bold',
+    };
+  }).filter((entry) => entry.text.trim());
+
   return {
     size,
     grid,
@@ -670,6 +685,7 @@ export function parseQrSvg(svg) {
     at: { x: translateX, y: translateY },
     scale,
     background: image ? image[1] : null,
+    texts,
   };
 }
 
@@ -799,6 +815,121 @@ function paintRect(pixels, width, height, x0, y0, w, h) {
   }
 }
 
+// ---- chữ ---------------------------------------------------------------------------------------
+//
+// Tên chủ tài khoản, số tài khoản và số tiền không nằm trong tấm ảnh nền — chúng là những thẻ
+// `<text>` riêng của SVG, và bộ vẽ của nền tảng bỏ qua cả `<text>` lẫn `<image>`. Nền chỉ có sẵn
+// các nhãn "Chủ tài khoản:", "Nội dung chuyển khoản:", còn chỗ điền thì trống.
+//
+// Nên chữ phải được vẽ vào chính tấm PNG. Font 5×7 đủ cho việc này và không cần thêm gì: chữ ở đây
+// là tên người, số tài khoản, số tiền — ASCII sau khi bỏ dấu.
+
+/** Nét của từng ký tự: 7 dòng, mỗi dòng 5 chấm, `1` là chấm đen. */
+const FONT = {
+  '0': '01110 10001 10011 10101 11001 10001 01110',
+  '1': '00100 01100 00100 00100 00100 00100 01110',
+  '2': '01110 10001 00001 00010 00100 01000 11111',
+  '3': '11111 00010 00100 00010 00001 10001 01110',
+  '4': '00010 00110 01010 10010 11111 00010 00010',
+  '5': '11111 10000 11110 00001 00001 10001 01110',
+  '6': '00110 01000 10000 11110 10001 10001 01110',
+  '7': '11111 00001 00010 00100 01000 01000 01000',
+  '8': '01110 10001 10001 01110 10001 10001 01110',
+  '9': '01110 10001 10001 01111 00001 00010 01100',
+  A: '01110 10001 10001 11111 10001 10001 10001',
+  B: '11110 10001 10001 11110 10001 10001 11110',
+  C: '01110 10001 10000 10000 10000 10001 01110',
+  D: '11100 10010 10001 10001 10001 10010 11100',
+  E: '11111 10000 10000 11110 10000 10000 11111',
+  F: '11111 10000 10000 11110 10000 10000 10000',
+  G: '01110 10001 10000 10111 10001 10001 01111',
+  H: '10001 10001 10001 11111 10001 10001 10001',
+  I: '01110 00100 00100 00100 00100 00100 01110',
+  J: '00111 00010 00010 00010 00010 10010 01100',
+  K: '10001 10010 10100 11000 10100 10010 10001',
+  L: '10000 10000 10000 10000 10000 10000 11111',
+  M: '10001 11011 10101 10101 10001 10001 10001',
+  N: '10001 11001 10101 10011 10001 10001 10001',
+  O: '01110 10001 10001 10001 10001 10001 01110',
+  P: '11110 10001 10001 11110 10000 10000 10000',
+  Q: '01110 10001 10001 10001 10101 10010 01101',
+  R: '11110 10001 10001 11110 10100 10010 10001',
+  S: '01111 10000 10000 01110 00001 00001 11110',
+  T: '11111 00100 00100 00100 00100 00100 00100',
+  U: '10001 10001 10001 10001 10001 10001 01110',
+  V: '10001 10001 10001 10001 10001 01010 00100',
+  W: '10001 10001 10001 10101 10101 11011 10001',
+  X: '10001 10001 01010 00100 01010 10001 10001',
+  Y: '10001 10001 01010 00100 00100 00100 00100',
+  Z: '11111 00001 00010 00100 01000 10000 11111',
+  ' ': '00000 00000 00000 00000 00000 00000 00000',
+  '.': '00000 00000 00000 00000 00000 01100 01100',
+  ',': '00000 00000 00000 00000 00110 00110 01100',
+  ':': '00000 01100 01100 00000 01100 01100 00000',
+  '-': '00000 00000 00000 11111 00000 00000 00000',
+  '_': '00000 00000 00000 00000 00000 00000 11111',
+  '/': '00001 00010 00010 00100 01000 01000 10000',
+  '(': '00010 00100 01000 01000 01000 00100 00010',
+  ')': '01000 00100 00010 00010 00010 00100 01000',
+  '+': '00000 00100 00100 11111 00100 00100 00000',
+  "'": '00100 00100 00000 00000 00000 00000 00000',
+  '"': '01010 01010 00000 00000 00000 00000 00000',
+  '*': '00100 10101 01110 11111 01110 10101 00100',
+  '&': '01100 10010 10100 01000 10101 10010 01101',
+};
+
+/** Chữ có dấu thành chữ trần: font không có dấu, mà tên với nhãn thì hay có. */
+export function asciiFold(text) {
+  return String(text ?? '')
+    .replace(/ /g, ' ')
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toUpperCase();
+}
+
+function hexColor(value) {
+  const match = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(String(value ?? ''));
+  return match ? [parseInt(match[1], 16), parseInt(match[2], 16), parseInt(match[3], 16)] : [74, 74, 74];
+}
+
+/** Vẽ một dòng chữ lên ảnh, theo đúng cách SVG căn nó: `x` là mốc, `y` là đường chân chữ. */
+export function drawText(pixels, width, height, text, { x, y, size = 16, anchor = 'start', color = [74, 74, 74], bold = false }) {
+  const glyphs = [...asciiFold(text)].map((ch) => (FONT[ch] ?? FONT[' ']).split(' '));
+  if (!glyphs.length) return;
+
+  const advance = 6;   // 5 chấm chữ + 1 chấm thở
+  let scale = Math.max(1, Math.round(size / 8));
+  while (scale > 1 && glyphs.length * advance * scale > width - 8) scale--;   // chữ dài thì thu lại, đừng tràn ra ngoài
+
+  const total = glyphs.length * advance * scale;
+  const startX = anchor === 'middle' ? x - total / 2 : anchor === 'end' ? x - total : x;
+  const top = y - 7 * scale;   // `y` là đường chân chữ, nét nằm ngay trên nó
+  const [r, g, b] = color;
+
+  for (let i = 0; i < glyphs.length; i++) {
+    for (let row = 0; row < 7; row++) {
+      for (let col = 0; col < 5; col++) {
+        if (glyphs[i][row][col] !== '1') continue;
+        const left = Math.round(startX + i * advance * scale + col * scale);
+        const up = Math.round(top + row * scale);
+        for (const extra of bold ? [0, scale] : [0]) {   // đậm bằng cách vẽ thêm một nét lệch phải
+          for (let dy = 0; dy < scale; dy++) {
+            for (let dx = 0; dx < scale; dx++) {
+              const px = left + extra + dx;
+              const py = up + dy;
+              if (px < 0 || py < 0 || px >= width || py >= height) continue;
+              const at = (py * width + px) * 4;
+              pixels[at] = r; pixels[at + 1] = g; pixels[at + 2] = b; pixels[at + 3] = 0xff;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 /**
  * Tấm card thành PNG: nền của VietQR, rồi mã vẽ đè lên đúng chỗ nền chừa sẵn.
  *
@@ -816,11 +947,18 @@ export function composeCardPng(parsed) {
 
   const { width, height } = background;
   const pixels = Buffer.from(background.pixels);
-  const { size, grid, scale, at } = parsed;
+  const { size, grid, scale, at, texts = [] } = parsed;
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
       if (grid[y][x]) paintRect(pixels, width, height, at.x + x * scale, at.y + y * scale, scale, scale);
     }
+  }
+
+  // Chữ vẽ sau mã: nó nằm dưới mã trên tấm card, và không chồng lên nhau.
+  for (const line of texts) {
+    drawText(pixels, width, height, line.text, {
+      x: line.x, y: line.y, size: line.size, anchor: line.anchor, bold: line.bold, color: hexColor(line.color),
+    });
   }
   return pngFromPixels(width, height, pixels);
 }
@@ -923,14 +1061,13 @@ export async function fetchQr(account, { amount = null, description = '' } = {},
 /**
  * Chữ đi kèm ảnh QR — số tiền và nội dung phải đọc được cả khi không mở ảnh.
  *
- * Link in kèm ở cuối, có chủ đích: nó là **nguyên văn** thứ bot đã hỏi VietQR, nên nhìn nó là biết
- * ngay số tài khoản, số tiền hay nội dung đã đi sai ở đâu — không phải mở log máy chủ ra dò.
+ * Không kèm link: link là thứ chỉ có ích khi ảnh không hiện, mà lúc ấy người ta cần biết bot đã hỏi
+ * VietQR cái gì hơn là một URL dài. Link vẫn được ghi vào log máy chủ để tra khi có chuyện.
  */
-export function qrCaption(account, amount, description, link = null) {
+export function qrCaption(account, amount, description) {
   const lines = [`QR chuyển tiền — ${account.bankLabel} ${account.accountNo}`, account.name];
   lines.push(amount === null ? 'Số tiền: để trống, người chuyển tự nhập' : `Số tiền: ${formatMoney(amount)}đ`);
   if (description) lines.push(`Nội dung: ${description}`);
-  if (link) lines.push('', link);
   return lines.join('\n');
 }
 
@@ -1118,9 +1255,7 @@ export async function run(token, {
       ? `Đã lưu tài khoản nhận tiền:\n${bank.label} · ${accountNo} · ${account.name}\n\nMã dưới đây là của chính tài khoản này — sai thì gõ lại register.`
       : `Đã lưu ${bank.label} · ${accountNo} · ${account.name}, nhưng chưa dựng được mã QR để xác nhận. Kiểm lại số tài khoản nếu thấy sai.`;
 
-    // Link đi kèm cả hai trường hợp: có mã thì nó là đường mở mã khi ảnh không hiện, không có mã thì
-    // nó là thứ duy nhất nói ra bot vừa hỏi VietQR cái gì mà bị từ chối.
-    await say(message.conversationId, `${confirmed}\n\n${card.link}`, message.messageId, { images: card.images });
+    await say(message.conversationId, confirmed, message.messageId, { images: card.images });
   }
 
   /** Mã QR chuyển tiền của người đang gõ. */
@@ -1152,7 +1287,7 @@ export async function run(token, {
       );
     }
 
-    const caption = qrCaption(account, asked.amount, asked.description, card.link);
+    const caption = qrCaption(account, asked.amount, asked.description);
     console.log(`    -> gen-qr ${account.bankLabel} ${account.accountNo} amount=${asked.amount}`);
     console.log(`       ${card.link}`);
 

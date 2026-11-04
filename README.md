@@ -56,24 +56,27 @@ dựng, người chuyển tự nhập.
 có cách nào đọc mã QR ai đó gửi lên. Đổi lại, `register` trả về ngay mã của tài khoản vừa lưu.
 
 Mã QR lấy từ [Quick Link của VietQR](https://www.vietqr.io/qr-dong) — một URL, không cần khoá.
-VietQR trả về SVG gồm hai phần:
+VietQR trả về SVG gồm ba phần, và **không phần nào gửi thẳng đi được**:
 
-- một `<image>` phủ kín khung — nền, có logo ngân hàng, tên chủ tài khoản, số tiền, nội dung
+- một `<image>` phủ kín khung — nền: khung, logo ngân hàng, các nhãn "Chủ tài khoản:", "Nội dung
+  chuyển khoản:"
+- vài thẻ `<text>` — tên chủ tài khoản, số tài khoản, số tiền
 - một `<path>` vẽ từng module của mã, nằm trong `<g transform>`
 
-**Tấm SVG ấy không gửi thẳng đi được.** Bộ vẽ SVG của nền tảng không vẽ thẻ `<image href="data:...">`,
-mà nền nằm đúng trong thẻ ấy — gửi SVG thì người nhận thấy mỗi mã trơ trên nền trắng, mất khung,
-mất logo. Ảnh raster thì nó vẽ được.
+Bộ vẽ SVG của nền tảng bỏ qua cả `<image>` lẫn `<text>`. Gửi SVG thì người nhận thấy mỗi mã trơ trên
+nền trắng — mất khung, mất logo, mất tên, mất số tài khoản, mất số tiền. Ảnh raster thì nó vẽ được.
 
-Nên `composeCardPng` giải tấm nền ra khỏi SVG (`decodePng`), vẽ lưới mã đè lên đúng chỗ nền chừa
-sẵn, rồi trả về **một tấm PNG duy nhất** — raster thì không có thẻ nào để bộ vẽ bỏ qua. Đó là đường
-duy nhất có cả khung lẫn mã, nên nó đi trước:
+Nên `composeCardPng` dựng lại **một tấm PNG duy nhất**: `decodePng` giải tấm nền ra, lưới mã được vẽ
+đè lên (`paintRect`), rồi các dòng `<text>` được vẽ bằng font bitmap 5×7 (`drawText`, `asciiFold` bỏ
+dấu vì font không có dấu). Đó là đường duy nhất có đủ mọi thứ, nên nó đi trước:
 
-1. `composeCardPng` — nền + mã trong một tấm PNG
+1. `composeCardPng` — nền + mã + chữ, một tấm PNG
 2. `qrPng` — chỉ mã, dạng PNG
 3. `qrSvg` — chỉ mã, dạng SVG
 
 Cuối cùng mới tới chữ không ảnh. Chữ của tin có ảnh đi kèm dưới dạng `rich`, không phải `text` trần.
+Tin nhắn **không in link** — link chỉ hữu ích khi ảnh không hiện, mà lúc ấy một URL dài cũng không
+giúp gì; nó vẫn được ghi vào log máy chủ để tra khi cần.
 
 ## Chạy
 
