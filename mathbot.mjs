@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { setTimeout as wait } from 'node:timers/promises';
+import zlib from 'node:zlib';
 
 export const API = process.env.ZEPLAO_BOT_API ?? 'https://api-bot.kuku.vn';
 export const STATE = process.env.MATHBOT_STATE
@@ -461,10 +462,10 @@ function formatStockResult(symbol, currentPrice, result, isCeiling) {
 // tiền cho chính người ấy. Khoá theo `userId` chứ không theo username: username có thể null và
 // đổi được, còn userId thì không.
 //
-// Ảnh lấy từ Quick Link của VietQR (https://www.vietqr.io/qr-dong) — một URL, không cần khoá, và
-// trả về SVG. Nhưng thứ nó trả về chỉ là cái vỏ: cả tấm card nằm gọn trong một thẻ
-// `<image href="data:image/png;base64,...">`. Bóc ruột ra là được đúng tấm PNG mà nền tảng nhận
-// (`dataBase64`), khỏi gọi API sinh mã, khỏi tự vẽ.
+// Ảnh lấy từ Quick Link của VietQR (https://www.vietqr.io/qr-dong) — một URL, không cần khoá, trả
+// về SVG. Nền tảng bot chỉ nhận ảnh PNG hoặc SVG sạch, mà SVG của VietQR thì không sạch theo nghĩa
+// nào dùng được — nên mã được dựng lại từ chính hình vector của nó (`parseQrSvg`) rồi vẽ thành PNG
+// (`qrPng`). Xem chú thích ở `parseQrSvg` để biết vì sao không bóc thẳng tấm ảnh nền.
 
 export const VIETQR_IMAGE = process.env.VIETQR_IMAGE ?? 'https://img.vietqr.io';
 export const VIETQR_API = process.env.VIETQR_API ?? 'https://api.vietqr.io';
@@ -604,47 +605,146 @@ export function parseQrRequest(text, me) {
   return { amount, description: cleanDescription(tail.join(' ')) };
 }
 
-/**
- * Ảnh QR và đường link của nó.
- *
- * Ảnh là null khi VietQR từ chối dựng — lúc ấy link vẫn còn nguyên để gửi kèm, vì một cái link
- * bấm được vẫn hơn một câu xin lỗi.
- */
-export async function fetchQr(account, { amount = null, description = '' } = {}, { image = VIETQR_IMAGE, fetchImpl = fetch } = {}) {
+/** Đường link Quick Link của một tài khoản. */
+export function qrLink(account, { amount = null, description = '' } = {}, { image = VIETQR_IMAGE } = {}) {
   const query = new URLSearchParams();
   if (amount) query.set('amount', String(amount));
   if (description) query.set('addInfo', description);
   if (account.name) query.set('accountName', account.name);
   const params = query.toString();
-  const link = `${image}/image/${account.bankId}-${account.accountNo}-${QR_TEMPLATE}.svg${params ? `?${params}` : ''}`;
+  return `${image}/image/${account.bankId}-${account.accountNo}-${QR_TEMPLATE}.svg${params ? `?${params}` : ''}`;
+}
 
+/**
+ * QR trong câu trả lời của VietQR là hình vector, không nằm trong tấm ảnh nền.
+ *
+ * Tấm SVG gồm đúng hai thứ dễ nhầm với nhau: một `<image>` phủ kín khung — ấy là **nền**, có logo
+ * ngân hàng và không có mã nào — và một `<g transform="translate(x y) scale(s)">` chứa ô trắng cùng
+ * một `<path>` vẽ từng module của mã. Bóc tấm nền ra gửi đi thì người nhận thấy đúng khung, đúng
+ * logo, và một khoảng trắng ở giữa.
+ *
+ * Nên mã phải dựng lại từ chính path ấy: mỗi lệnh `M<x> <y>h<w>v1h-<w>z` là một dải module đen
+ * nằm ngang, cộng lại thành lưới ô vuông, rồi vẽ lưới thành PNG.
+ */
+export function parseQrSvg(svg) {
+  const group = /<g\b[^>]*transform="translate\(\s*([\d.]+)[\s,]+([\d.]+)\s*\)\s*scale\(\s*([\d.]+)\s*\)"[^>]*>([\s\S]*?)<\/g>/.exec(svg);
+  if (!group) return null;
+  const inner = group[4];
+  const box = /<rect\b[^>]*width="(\d+)"[^>]*height="(\d+)"/.exec(inner);
+  const path = /<path\b[^>]*\bd="([^"]*)"/.exec(inner);
+  if (!box || !path) return null;
+
+  const size = Number(box[1]);
+  if (Number(box[2]) !== size || !Number.isInteger(size) || size < 9 || size > 200) return null;
+
+  const grid = Array.from({ length: size }, () => new Uint8Array(size));
+  let runs = 0;
+  for (const run of path[1].matchAll(/M(\d+)\s+(\d+)\s*h(\d+)\s*v1\s*h-\d+\s*z/g)) {
+    const x = Number(run[1]), y = Number(run[2]), width = Number(run[3]);
+    if (y >= size) return null;                      // chạm ra ngoài khung nghĩa là không phải mã
+    for (let i = 0; i < width && x + i < size; i++) grid[y][x + i] = 1;
+    runs++;
+  }
+  if (runs < 50) return null;
+
+  return { size, grid, version: (size - 17) / 4 };
+}
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let k = 0; k < 8; k++) crc = crc & 1 ? 0xedb88320 ^ (crc >>> 1) : crc >>> 1;
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, body) {
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(body.length, 0);
+  head.write(type, 4, 'latin1');
+  const tail = Buffer.alloc(4);
+  tail.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), body])), 0);
+  return Buffer.concat([head, body, tail]);
+}
+
+/** Lưới module thành PNG xám, mỗi module `scale` điểm ảnh, viền trắng `quiet` module. */
+export function qrPng(grid, { scale = 8, quiet = 4 } = {}) {
+  const size = grid.length;
+  const side = (size + quiet * 2) * scale;
+  const rows = [];
+  const blank = Buffer.alloc(side, 0xff);
+  for (let i = 0; i < quiet * scale; i++) rows.push(blank);
+
+  const margin = Buffer.alloc(quiet * scale, 0xff);
+  for (const row of grid) {
+    const line = Buffer.alloc(side, 0xff);
+    let at = quiet * scale;
+    for (let x = 0; x < size; x++) {
+      if (!row[x]) { at += scale; continue; }
+      for (let i = 0; i < scale; i++) line[at + i] = 0;
+      at += scale;
+    }
+    for (let i = 0; i < scale; i++) rows.push(Buffer.concat([margin, line, margin]));
+  }
+  for (let i = 0; i < quiet * scale; i++) rows.push(blank);
+
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(side, 0);
+  header.writeUInt32BE(side, 4);
+  header[8] = 8;    // 8 bit một điểm ảnh
+  header[9] = 0;    // thang xám
+  const raw = Buffer.concat(rows.map((row) => Buffer.concat([Buffer.from([0]), row])));
+
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', zlib.deflateSync(raw, { level: 9 })),
+    pngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+/**
+ * Ảnh QR và đường link của nó.
+ *
+ * Ảnh là null khi VietQR từ chối dựng, hoặc khi câu trả lời không còn là mã dựng lại được — lúc ấy
+ * link vẫn còn nguyên để gửi kèm, vì một cái link bấm được vẫn hơn một câu xin lỗi.
+ */
+export async function fetchQr(account, { amount = null, description = '' } = {}, { image = VIETQR_IMAGE, fetchImpl = fetch } = {}) {
+  const link = qrLink(account, { amount, description }, { image });
   const response = await fetchImpl(link, { signal: AbortSignal.timeout(TIMEOUT_MS) });
   const body = await response.text();
   if (!response.ok) return { link, image: null, status: response.status };
 
-  const embedded = /data:image\/png;base64,([A-Za-z0-9+/=]+)/.exec(body);
-  if (embedded && embedded[1].length <= MOST_IMAGE_BYTES) {
-    return {
-      link,
-      image: { fileName: `vietqr-${account.accountNo}.png`, contentType: 'image/png', dataBase64: embedded[1] },
-      status: response.status,
-    };
-  }
-  if (/<svg[\s>]/i.test(body) && body.length <= MOST_IMAGE_BYTES) {
-    return {
-      link,
-      image: { fileName: `vietqr-${account.accountNo}.svg`, contentType: 'image/svg+xml', svg: body },
-      status: response.status,
-    };
-  }
-  return { link, image: null, status: response.status };
+  const parsed = parseQrSvg(body);
+  if (!parsed) return { link, image: null, status: response.status, reason: 'unreadable_qr' };
+
+  const png = qrPng(parsed.grid);
+  if (png.length > MOST_IMAGE_BYTES) return { link, image: null, status: response.status, reason: 'too_large' };
+
+  return {
+    link,
+    image: {
+      fileName: `vietqr-${account.accountNo}.png`,
+      contentType: 'image/png',
+      dataBase64: png.toString('base64'),
+    },
+    status: response.status,
+    version: parsed.version,
+  };
 }
 
-/** Chữ đi kèm ảnh QR — số tiền và nội dung phải đọc được cả khi không mở ảnh. */
-export function qrCaption(account, amount, description) {
+/**
+ * Chữ đi kèm ảnh QR — số tiền và nội dung phải đọc được cả khi không mở ảnh.
+ *
+ * Link in kèm ở cuối, có chủ đích: nó là **nguyên văn** thứ bot đã hỏi VietQR, nên nhìn nó là biết
+ * ngay số tài khoản, số tiền hay nội dung đã đi sai ở đâu — không phải mở log máy chủ ra dò.
+ */
+export function qrCaption(account, amount, description, link = null) {
   const lines = [`QR chuyển tiền — ${account.bankLabel} ${account.accountNo}`, account.name];
   lines.push(amount === null ? 'Số tiền: để trống, người chuyển tự nhập' : `Số tiền: ${formatMoney(amount)}đ`);
   if (description) lines.push(`Nội dung: ${description}`);
+  if (link) lines.push('', link);
   return lines.join('\n');
 }
 
@@ -718,6 +818,8 @@ export async function run(token, {
   statePath = STATE,
   fetchImpl = fetch,
   feed = FEED,
+  qrImage = VIETQR_IMAGE,
+  qrApi = VIETQR_API,
 } = {}) {
   const auth = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
 
@@ -783,7 +885,7 @@ export async function run(token, {
 
     let bank;
     try {
-      bank = await lookupBank(registration.bankToken, { fetchImpl });
+      bank = await lookupBank(registration.bankToken, { api: qrApi, fetchImpl });
     } catch (problem) {
       console.error(`    -> tra danh sách ngân hàng hỏng: ${problem}`);
       await say(message.conversationId, 'Chưa tra được danh sách ngân hàng, thử lại sau nhé.', message.messageId);
@@ -817,27 +919,22 @@ export async function run(token, {
     // khả năng sai — đừng lưu một thứ chưa từng dựng được thành mã.
     let card;
     try {
-      card = await fetchQr(account, {}, { fetchImpl });
+      card = await fetchQr(account, {}, { image: qrImage, fetchImpl });
     } catch (problem) {
       console.error(`    -> dựng QR xác nhận hỏng: ${problem}`);
-      card = { image: null, link: null };
+      card = { image: null, link: qrLink(account) };
     }
+
+    console.log(`    -> register ${bank.label} ${accountNo} ${card.image ? '(có mã xác nhận)' : '(không dựng được mã)'}`);
+    console.log(`       ${card.link}`);
 
     const confirmed = card.image
       ? `Đã lưu tài khoản nhận tiền:\n${bank.label} · ${accountNo} · ${account.name}\n\nMã dưới đây là của chính tài khoản này — sai thì gõ lại register.`
-      : null;
+      : `Đã lưu ${bank.label} · ${accountNo} · ${account.name}, nhưng chưa dựng được mã QR để xác nhận. Kiểm lại số tài khoản nếu thấy sai.`;
 
-    if (confirmed) {
-      console.log(`    -> register ${bank.label} ${accountNo} (có mã xác nhận)`);
-      await say(message.conversationId, confirmed, message.messageId, { image: card.image });
-      return;
-    }
-
-    await say(
-      message.conversationId,
-      `Đã lưu ${bank.label} · ${accountNo} · ${account.name}, nhưng chưa dựng được mã QR để xác nhận. Kiểm lại số tài khoản nếu thấy sai.`,
-      message.messageId,
-    );
+    // Link đi kèm cả hai trường hợp: có mã thì nó là đường mở mã khi ảnh không hiện, không có mã thì
+    // nó là thứ duy nhất nói ra bot vừa hỏi VietQR cái gì mà bị từ chối.
+    await say(message.conversationId, `${confirmed}\n\n${card.link}`, message.messageId, card.image ? { image: card.image } : {});
   }
 
   /** Mã QR chuyển tiền của người đang gõ. */
@@ -851,24 +948,38 @@ export async function run(token, {
 
     let card;
     try {
-      card = await fetchQr(account, { amount: asked.amount, description: asked.description }, { fetchImpl });
+      card = await fetchQr(account, { amount: asked.amount, description: asked.description }, { image: qrImage, fetchImpl });
     } catch (problem) {
       console.error(`    -> dựng QR hỏng: ${problem}`);
       await say(message.conversationId, 'Chưa dựng được mã QR, thử lại sau nhé.', message.messageId);
       return;
     }
 
-    const caption = qrCaption(account, asked.amount, asked.description);
-    console.log(`    -> gen-qr ${account.bankLabel} ${account.accountNo} amount=${asked.amount}`);
+    // Số tiền gõ vào mà đọc không ra thì nói thẳng, đừng lặng lẽ bỏ đi: người ta sẽ tưởng bot nhận
+    // rồi, và chỉ phát hiện lúc có người chuyển thiếu tiền.
+    if (asked.unreadable) {
+      console.log(`    -> số tiền "${asked.unreadable}" không đọc được`);
+      await say(
+        message.conversationId,
+        `Không đọc được số tiền "${asked.unreadable}", nên mã dưới đây để trống số tiền.\n${usageQr(me.username)}`,
+        message.messageId,
+      );
+    }
 
-    // Ảnh là phần chính, nhưng không phải phần duy nhất: máy chủ từ chối ảnh thì câu trả lời vẫn
-    // phải đi, kèm link bấm được để người ta tự mở mã.
+    const caption = qrCaption(account, asked.amount, asked.description, card.link);
+    console.log(`    -> gen-qr ${account.bankLabel} ${account.accountNo} amount=${asked.amount}`);
+    console.log(`       ${card.link}`);
+
     if (card.image) {
       await say(message.conversationId, caption, message.messageId, { image: card.image });
       return;
     }
-    const fallback = card.link ? `${caption}\n\nMã QR: ${card.link}` : caption;
-    await say(message.conversationId, fallback, message.messageId);
+
+    // Không dựng được mã thì chữ vẫn đi, kèm một dòng nói ra vì sao — người hỏi còn biết đường thử lại.
+    const why = card.reason === 'unreadable_qr'
+      ? 'VietQR trả về thứ không đọc ra mã được'
+      : card.reason === 'too_large' ? 'mã quá lớn để gửi' : 'VietQR không dựng được mã';
+    await say(message.conversationId, `${caption}\n(${why}.)`, message.messageId);
   }
 
   async function onMessage(message) {

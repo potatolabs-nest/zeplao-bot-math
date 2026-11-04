@@ -9,6 +9,8 @@ import { setTimeout as wait } from 'node:timers/promises';
 import {
   askedCalcFor, safeCalc, run, AUTHOR,
   parseStockLookup, calcCeilingSessions, calcFloorSessions, fetchPrice,
+  parseRegister, parseQrRequest, parseAmount, cleanDescription, formatMoney,
+  stripBotMention, lookupBank, bankDirectory, parseQrSvg, qrPng, qrLink, qrCaption, fetchQr,
 } from './mathbot.mjs';
 
 const ME = { username: 'mathtanbot', displayName: 'mathbot' };
@@ -118,6 +120,71 @@ const ROASTS = [
 ];
 const msg = (fields) => ({ conversationId: 'p1', conversationType: 'group', messageId: 'm1', ...fields });
 
+// ---- vietqr: tài khoản nhận tiền ---------------------------------------------------------------
+
+const BANKS = [
+  { bin: '963388', code: 'TIMO', shortName: 'Timo', short_name: 'Timo', name: 'Ngân hàng số Timo by Ban Viet Bank' },
+  { bin: '970436', code: 'VCB', shortName: 'Vietcombank', short_name: 'Vietcombank', name: 'Ngân hàng TMCP Ngoại Thương Việt Nam' },
+];
+
+/** Danh sách ngân hàng, một lần trả lời, để `bankDirectory` có thứ mà tra. */
+function stubBanks(banks = BANKS) {
+  const server = createServer((request, response) => {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ data: banks }));
+  });
+  return new Promise((ready) => {
+    server.listen(0, '127.0.0.1', () => ready({ api: `http://127.0.0.1:${server.address().port}`, close: () => server.close() }));
+  });
+}
+
+/**
+ * Một lưới module đủ để nhận ra, không phải mã thật — đúng dạng VietQR vẽ: `<path>` gồm các dải
+ * `M<x> <y>h<w>v1h-<w>z`.
+ */
+const GRID = 21;
+function fakeQrSvg({ size = GRID, accountNo = '0905473034' } = {}) {
+  const runs = [];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x += 3) {
+      // ba ô vuông góc kiểu finder pattern, phần còn lại thưa
+      const corner = (x < 7 || x >= size - 7) && (y < 7 || y >= size - 7);
+      if (corner || (x + y) % 5 === 0) runs.push(`M${x} ${y}h2v1h-2z`);
+    }
+  }
+  return [
+    `<svg xmlns="http://www.w3.org/2000/svg" width="540" height="640" viewBox="0 0 540 640">`,
+    // Tấm nền — thứ từng bị bóc nhầm rồi gửi đi, và người nhận chỉ thấy khung với logo.
+    `<image x="0" y="0" width="540" height="640" href="data:image/png;base64,${Buffer.alloc(64, 7).toString('base64')}"/>`,
+    `<text x="270" y="586" text-anchor="middle">${accountNo}</text>`,
+    `<g transform="translate(92 94) scale(6.2631578947368425)">`,
+    `<rect width="${size}" height="${size}" fill="#ffffff"/>`,
+    `<path fill="#111111" d="${runs.join('')}"/>`,
+    `</g></svg>`,
+  ].join('');
+}
+
+/** Quick Link của VietQR: mã khi đường dẫn hợp lệ, lỗi khi ngân hàng không có thật. */
+function stubVietQr({ bankIds = ['963388'], svg = fakeQrSvg() } = {}) {
+  const asked = [];
+  const server = createServer((request, response) => {
+    const path = decodeURIComponent(request.url);
+    asked.push(path);
+    const bankId = /\/image\/([^-]+)-/.exec(path)?.[1];
+    if (!bankIds.includes(bankId)) {
+      response.writeHead(404, { 'Content-Type': 'application/json' });
+      response.end('{"error":"Không tìm thấy ngân hàng"}');
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8' });
+    response.end(svg);
+  });
+  return new Promise((ready) => {
+    server.listen(0, '127.0.0.1', () => ready({ asked, image: `http://127.0.0.1:${server.address().port}`, close: () => server.close() }));
+  });
+}
+
+
 // ---- basic math -------------------------------------------------------------------------------
 
 test('1 + 1 = 2', () => assert.equal(safeCalc('1 + 1'), 2n));
@@ -182,6 +249,7 @@ test('null message', () => assert.equal(askedCalcFor(null, ME), null));
 
 async function stubApi(updates) {
   const sent = [];
+  const state = { refuseImages: false };
   let queue = [...updates];
   const server = createServer((request, response) => {
     let body = '';
@@ -190,13 +258,28 @@ async function stubApi(updates) {
       const path = request.url.split('?')[0];
       const answer = (value) => { response.writeHead(200, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(value)); };
       if (path === '/getMe') return answer(ME);
-      if (path === '/sendMessage') { sent.push(JSON.parse(body)); return answer({ messageId: `m${sent.length}` }); }
+      if (path === '/sendMessage') {
+        const payload = JSON.parse(body);
+        // Máy chủ từ chối tin có ảnh, đúng như lúc kho ảnh trục trặc — chữ phải đi đường riêng.
+        if (state.refuseImages && payload.image) {
+          response.writeHead(400, { 'Content-Type': 'application/json' });
+          return response.end('{"error":"bot_image_storage_unavailable"}');
+        }
+        sent.push(payload);
+        return answer({ messageId: `m${sent.length}` });
+      }
       if (path === '/getUpdates') { if (queue.length) { const batch = queue; queue = []; return answer(batch); } await wait(20); return answer([]); }
       response.writeHead(404); response.end('{}');
     });
   });
   await new Promise((ready) => server.listen(0, '127.0.0.1', ready));
-  return { sent, api: `http://127.0.0.1:${server.address().port}`, close: () => server.close() };
+  return {
+    sent,
+    set refuseImages(value) { state.refuseImages = value; },
+    get refuseImages() { return state.refuseImages; },
+    api: `http://127.0.0.1:${server.address().port}`,
+    close: () => server.close(),
+  };
 }
 
 function stubFeed(prices) {
@@ -213,9 +296,13 @@ function stubFeed(prices) {
   });
 }
 
-async function withBot(updates, { expect = 1, settle = 200, prices = {} } = {}) {
+async function withBot(updates, {
+  expect = 1, settle = 200, prices = {}, banks = BANKS, qrBankIds = ['963388'], qrSvg = fakeQrSvg(),
+} = {}) {
   const platform = await stubApi(updates);
   const feedServer = await stubFeed(prices);
+  const bankServer = await stubBanks(banks);
+  const qrServer = await stubVietQr({ bankIds: qrBankIds, svg: qrSvg });
   const stopping = new AbortController();
   const statePath = join(tmpdir(), `math-${randomUUID()}.json`);
   const loop = run('token', {
@@ -224,6 +311,8 @@ async function withBot(updates, { expect = 1, settle = 200, prices = {} } = {}) 
     statePath,
     fetchImpl: fetch,
     feed: feedServer.feed,
+    qrImage: qrServer.image,
+    qrApi: bankServer.api,
   });
   const deadline = Date.now() + 5000;
   while (platform.sent.length < expect && Date.now() < deadline) await wait(20);
@@ -232,7 +321,9 @@ async function withBot(updates, { expect = 1, settle = 200, prices = {} } = {}) 
   await loop.catch(() => {});
   platform.close();
   feedServer.close();
-  return platform;
+  bankServer.close();
+  qrServer.close();
+  return { ...platform, qrAsked: qrServer.asked };
 }
 
 const update = (fields, id = 1) => ({ id, kind: 'message', message: msg(fields) });
@@ -389,4 +480,271 @@ test('@mathtanbot help trả về help', async () => {
   assert.equal(sent.length, 1);
   assert.match(sent[0].text, /Cú pháp tính toán/);
   assert.match(sent[0].text, /pom vebo 7/);
+});
+
+// ---- vietqr: đọc câu lệnh ---------------------------------------------------------------------
+
+test('parseRegister: bank, số tk, tên', () => {
+  assert.deepEqual(parseRegister('register timo 0905473034 nguyen tan hieu', ME), {
+    bankToken: 'timo', accountNo: '0905473034', name: 'nguyen tan hieu',
+  });
+});
+
+test('parseRegister: đã bỏ mention, tên có dấu', () => {
+  assert.deepEqual(parseRegister('@mathtanbot register timo 0905473034 Nguyễn Tấn Hiếu', ME), {
+    bankToken: 'timo', accountNo: '0905473034', name: 'Nguyễn Tấn Hiếu',
+  });
+});
+
+test('parseRegister: thiếu tên thì không phải lệnh', () => {
+  assert.equal(parseRegister('register timo 0905473034', ME), null);
+  assert.equal(parseRegister('register timo', ME), null);
+  assert.equal(parseRegister('1 + 1', ME), null);
+});
+
+test('parseQrRequest: số tiền và nội dung', () => {
+  assert.deepEqual(parseQrRequest('gen-qr 100000 tra tien an', ME), { amount: 100000, description: 'tra tien an' });
+});
+
+test('parseQrRequest: không có gì thì mã vẫn dựng, để trống tiền', () => {
+  assert.deepEqual(parseQrRequest('gen-qr', ME), { amount: null, description: '' });
+});
+
+test('parseQrRequest: chỉ có nội dung', () => {
+  assert.deepEqual(parseQrRequest('gen-qr tra tien an', ME), { amount: null, description: 'tra tien an', unreadable: 'tra' });
+});
+
+test('parseAmount: các kiểu người Việt gõ', () => {
+  assert.equal(parseAmount('100000'), 100000);
+  assert.equal(parseAmount('100.000'), 100000);
+  assert.equal(parseAmount('100,000'), 100000);
+  assert.equal(parseAmount('100k'), 100000);
+  assert.equal(parseAmount('1,5tr'), 1500000);
+  assert.equal(parseAmount('2 triệu'), 2000000);
+  assert.equal(parseAmount('1tỷ'), 1000000000);
+});
+
+test('parseAmount: thứ không đọc được thì trả null, không đoán bừa', () => {
+  assert.equal(parseAmount('abc'), null);
+  assert.equal(parseAmount(''), null);
+  assert.equal(parseAmount('0'), null);
+  assert.equal(parseAmount('1.2.3'), null);
+  assert.equal(parseAmount('99999999999999'), null);
+});
+
+test('cleanDescription: bỏ ký tự lạ, cắt 50', () => {
+  assert.equal(cleanDescription('tra <b>tien</b> "an"'), 'tra b tien b an');
+  assert.equal(cleanDescription('x'.repeat(80)).length, 50);
+});
+
+test('formatMoney: chấm nghìn', () => {
+  assert.equal(formatMoney(100000), '100.000');
+  assert.equal(formatMoney(1500), '1.500');
+  assert.equal(formatMoney(999), '999');
+});
+
+test('stripBotMention: bỏ cả username lẫn displayName', () => {
+  assert.equal(stripBotMention('@mathtanbot  register timo 1 x', ME), 'register timo 1 x');
+  assert.equal(stripBotMention('@mathbot gen-qr 100k', ME), 'gen-qr 100k');
+});
+
+// ---- vietqr: dựng mã ---------------------------------------------------------------------------
+
+test('parseQrSvg: lấy lưới module từ path, không lấy ảnh nền', () => {
+  const parsed = parseQrSvg(fakeQrSvg());
+  assert.equal(parsed.size, GRID);
+  assert.equal(parsed.grid.length, GRID);
+  assert.ok(parsed.grid[0][0], 'góc trên trái phải là module đen');
+  assert.ok(parsed.grid.flat().some((v) => v), 'phải có module đen');
+});
+
+test('parseQrSvg: không phải mã thì trả null', () => {
+  assert.equal(parseQrSvg('<svg xmlns="http://www.w3.org/2000/svg"></svg>'), null);
+  assert.equal(parseQrSvg('không phải svg'), null);
+  assert.equal(parseQrSvg('<svg><g transform="translate(1 1) scale(2)"><rect width="4" height="4"/><path d="M0 0h1v1h-1z"/></g></svg>'), null);
+});
+
+test('qrPng: ra PNG thật, đúng kích thước', () => {
+  const { grid } = parseQrSvg(fakeQrSvg());
+  const png = qrPng(grid, { scale: 4, quiet: 2 });
+  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.equal(png.readUInt32BE(16), (GRID + 4) * 4);
+  assert.equal(png.readUInt32BE(20), (GRID + 4) * 4);
+});
+
+test('qrLink: đủ tham số khi có, chỉ còn tên chủ tài khoản khi không', () => {
+  const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'NGUYEN TAN HIEU' };
+  const full = qrLink(account, { amount: 100000, description: 'tra tien an' });
+  assert.match(full, /img\.vietqr\.io\/image\/963388-0905473034-compact2\.svg\?/);
+  assert.match(full, /amount=100000/);
+  assert.match(full, /addInfo=tra\+tien\+an/);
+  assert.match(full, /accountName=NGUYEN\+TAN\+HIEU/);
+  // Không tiền, không nội dung thì vẫn còn tên chủ tài khoản — tên là một phần của tấm card.
+  const bare = qrLink(account);
+  assert.doesNotMatch(bare, /amount=/);
+  assert.doesNotMatch(bare, /addInfo=/);
+  assert.match(bare, /accountName=NGUYEN\+TAN\+HIEU/);
+});
+
+test('qrCaption: luôn có link khi được đưa', () => {
+  const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'NGUYEN TAN HIEU' };
+  const caption = qrCaption(account, 100000, 'tra tien an', 'https://img.vietqr.io/image/x.svg');
+  assert.match(caption, /Timo 0905473034/);
+  assert.match(caption, /Số tiền: 100\.000đ/);
+  assert.match(caption, /Nội dung: tra tien an/);
+  assert.match(caption, /https:\/\/img\.vietqr\.io\/image\/x\.svg/);
+});
+
+test('fetchQr: dựng lại mã từ SVG của VietQR', async () => {
+  const server = await stubVietQr();
+  const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'NGUYEN TAN HIEU' };
+  const card = await fetchQr(account, { amount: 100000, description: 'tra tien an' }, { image: server.image });
+  assert.equal(card.status, 200);
+  assert.equal(card.image.contentType, 'image/png');
+  assert.equal(card.version, (GRID - 17) / 4);
+  const png = Buffer.from(card.image.dataBase64, 'base64');
+  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.match(server.asked[0], /amount=100000/);
+  server.close();
+});
+
+test('fetchQr: ngân hàng sai thì không có ảnh, vẫn còn link', async () => {
+  const server = await stubVietQr({ bankIds: ['970436'] });
+  const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'X' };
+  const card = await fetchQr(account, {}, { image: server.image });
+  assert.equal(card.image, null);
+  assert.match(card.link, /963388-0905473034/);
+  server.close();
+});
+
+test('lookupBank: tra theo tên viết tắt, shortName và BIN', async () => {
+  const server = await stubBanks();
+  for (const token of ['timo', 'Timo', 'TIMO', '963388']) {
+    const bank = await lookupBank(token, { api: server.api });
+    assert.equal(bank.bankId, '963388', `token ${token}`);
+    assert.equal(bank.label, 'Timo');
+  }
+  assert.equal(await lookupBank('khong-co-ngan-hang-nay', { api: server.api }), null);
+  server.close();
+});
+
+test('bankDirectory: nhớ theo gốc API, không trả danh sách của server khác', async () => {
+  const first = await stubBanks([{ bin: '111111', code: 'AAA', shortName: 'AAA', short_name: 'AAA' }]);
+  const second = await stubBanks([{ bin: '222222', code: 'BBB', shortName: 'BBB', short_name: 'BBB' }]);
+  assert.equal((await lookupBank('AAA', { api: first.api })).bankId, '111111');
+  assert.equal((await lookupBank('BBB', { api: second.api })).bankId, '222222');
+  first.close();
+  second.close();
+});
+
+// ---- vietqr: qua vòng lặp bot ------------------------------------------------------------------
+
+test('register: lưu tài khoản rồi gửi mã xác nhận', async () => {
+  const { sent, qrAsked } = await withBot(
+    [update({ text: '@mathtanbot register timo 0905473034 nguyen tan hieu', from: { userId: 'u1', username: 'hieu' } })],
+    { settle: 500 },   // hai lượt gửi: tấm xác nhận và, nếu ảnh bị từ chối, tin chữ gửi lại
+  );
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /Đã lưu tài khoản nhận tiền/);
+  assert.match(sent[0].text, /Timo · 0905473034 · nguyen tan hieu/);
+  assert.match(sent[0].text, /\/image\/963388-0905473034/, 'phải in link để nhìn ra sai ở đâu');
+  assert.equal(sent[0].image.fileName, 'vietqr-0905473034.png');
+  assert.equal(sent[0].image.contentType, 'image/png');
+  const png = Buffer.from(sent[0].image.dataBase64, 'base64');
+  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  assert.equal(qrAsked.length, 1, 'VietQR chỉ bị hỏi một lần cho tấm xác nhận');
+});
+
+test('register: ngân hàng không có thì nói ra, không lưu', async () => {
+  const { sent } = await withBot(
+    [update({ text: '@mathtanbot register khongconganhang 0905473034 hieu', from: { userId: 'u1' } })],
+  );
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /Không có ngân hàng nào tên "khongconganhang"/);
+});
+
+test('register: số tài khoản sai thì nói ra, không lưu', async () => {
+  const { sent } = await withBot(
+    [update({ text: '@mathtanbot register timo 12 hieu', from: { userId: 'u1' } })],
+  );
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /không hợp lệ/);
+});
+
+test('register: số tài khoản có gạch nối vẫn nhận', async () => {
+  const { sent } = await withBot(
+    [update({ text: '@mathtanbot register timo 090-547-3034 hieu', from: { userId: 'u1' } })],
+  );
+  assert.match(sent[0].text, /Timo · 0905473034/);
+});
+
+test('gen-qr: chưa register thì nhắc đăng ký', async () => {
+  const { sent } = await withBot([update({ text: '@mathtanbot gen-qr 100k tra tien', from: { userId: 'u9' } })]);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].text, /chưa đăng ký tài khoản/);
+  assert.match(sent[0].text, /register <ngân hàng>/);
+});
+
+test('gen-qr: gửi mã của chính người gõ, kèm tiền và nội dung', async () => {
+  const { sent } = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1' } }, 1),
+    update({ text: '@mathtanbot gen-qr 100k tra tien an trua', from: { userId: 'u1' } }, 2),
+  ], { expect: 2 });
+  assert.equal(sent.length, 2);
+  assert.match(sent[1].text, /QR chuyển tiền — Timo 0905473034/);
+  assert.match(sent[1].text, /Số tiền: 100\.000đ/);
+  assert.match(sent[1].text, /Nội dung: tra tien an trua/);
+  assert.match(sent[1].text, /amount=100000/);
+  assert.equal(sent[1].image.contentType, 'image/png');
+});
+
+test('gen-qr: người khác không thấy mã của mình', async () => {
+  const { sent } = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1' } }, 1),
+    update({ text: '@mathtanbot gen-qr 100k', from: { userId: 'u2' } }, 2),
+  ], { expect: 2 });
+  assert.match(sent[0].text, /Đã lưu tài khoản/);
+  assert.match(sent[1].text, /chưa đăng ký tài khoản/, 'u2 chưa register nên không có mã');
+  assert.equal(sent[1].image, undefined);
+});
+
+test('gen-qr: số tiền đọc không ra thì nói thẳng', async () => {
+  const { sent } = await withBot([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1' } }, 1),
+    update({ text: '@mathtanbot gen-qr abcxyz noi dung gi do', from: { userId: 'u1' } }, 2),
+  ], { expect: 3 });
+  assert.match(sent[1].text, /Không đọc được số tiền "abcxyz"/);
+  assert.match(sent[2].text, /Số tiền: để trống/);
+});
+
+test('gen-qr: máy chủ từ chối ảnh thì chữ vẫn đi', async () => {
+  const platform = await stubApi([
+    update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1' } }, 1),
+    update({ text: '@mathtanbot gen-qr 100k tra tien', from: { userId: 'u1' } }, 2),
+  ]);
+  platform.refuseImages = true;
+  const feedServer = await stubFeed({});
+  const bankServer = await stubBanks();
+  const qrServer = await stubVietQr();
+  const stopping = new AbortController();
+  const loop = run('token', {
+    signal: stopping.signal,
+    api: platform.api,
+    statePath: join(tmpdir(), `math-${randomUUID()}.json`),
+    fetchImpl: fetch,
+    feed: feedServer.feed,
+    qrImage: qrServer.image,
+    qrApi: bankServer.api,
+  });
+  const deadline = Date.now() + 5000;
+  while (platform.sent.length < 2 && Date.now() < deadline) await wait(20);
+  await wait(200);
+  stopping.abort();
+  await loop.catch(() => {});
+  platform.close(); feedServer.close(); bankServer.close(); qrServer.close();
+  // Tin có ảnh bị từ chối nên không vào `sent`; chỉ hai tin chữ gửi lại nằm đó.
+  assert.equal(platform.sent.length, 2, 'tin có ảnh bị từ chối, chữ đi đường riêng');
+  assert.equal(platform.sent[1].image, undefined);
+  assert.match(platform.sent[1].text, /Số tiền: 100\.000đ/);
+  assert.match(platform.sent[1].text, /\/image\/963388-0905473034/, 'mất ảnh thì còn link');
 });
