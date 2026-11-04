@@ -10,7 +10,7 @@ import {
   askedCalcFor, safeCalc, run, AUTHOR,
   parseStockLookup, calcCeilingSessions, calcFloorSessions, fetchPrice,
   parseRegister, parseQrRequest, parseAmount, cleanDescription, formatMoney,
-  stripBotMention, lookupBank, bankDirectory, parseQrSvg, qrPng, qrSvg, qrLink, qrCaption, fetchQr,
+  stripBotMention, lookupBank, bankDirectory, parseQrSvg, composeQrSvg, qrPng, qrSvg, qrLink, qrCaption, fetchQr,
 } from './mathbot.mjs';
 
 const ME = { username: 'mathtanbot', displayName: 'mathbot' };
@@ -249,7 +249,7 @@ test('null message', () => assert.equal(askedCalcFor(null, ME), null));
 
 async function stubApi(updates) {
   const sent = [];
-  const state = { refuseImages: false, refuseSvg: false };
+  const state = { refuseImages: false, refuseBacked: false };
   let queue = [...updates];
   const server = createServer((request, response) => {
     let body = '';
@@ -260,9 +260,10 @@ async function stubApi(updates) {
       if (path === '/getMe') return answer(ME);
       if (path === '/sendMessage') {
         const payload = JSON.parse(body);
-        const isSvg = payload.image?.contentType === 'image/svg+xml';
-        // `refuseImages` là kho ảnh hỏng hẳn; `refuseSvg` chỉ là không chịu SVG, để PNG đi thay.
-        if (payload.image && (state.refuseImages || (state.refuseSvg && isSvg))) {
+        // `refuseImages` là kho ảnh hỏng hẳn; `refuseBacked` chỉ là không chịu tấm nào mang theo
+        // ảnh nền (`<image href="data:...">`), để tấm SVG trơ đi thay.
+        const backed = (payload.image?.svg ?? '').includes('<image ');
+        if (payload.image && (state.refuseImages || (state.refuseBacked && backed))) {
           response.writeHead(400, { 'Content-Type': 'application/json' });
           return response.end('{"error":"bot_image_storage_unavailable"}');
         }
@@ -278,8 +279,8 @@ async function stubApi(updates) {
     sent,
     set refuseImages(value) { state.refuseImages = value; },
     get refuseImages() { return state.refuseImages; },
-    set refuseSvg(value) { state.refuseSvg = value; },
-    get refuseSvg() { return state.refuseSvg; },
+    set refuseBacked(value) { state.refuseBacked = value; },
+    get refuseBacked() { return state.refuseBacked; },
     api: `http://127.0.0.1:${server.address().port}`,
     close: () => server.close(),
   };
@@ -301,11 +302,11 @@ function stubFeed(prices) {
 
 async function withBot(updates, {
   expect = 1, settle = 200, prices = {}, banks = BANKS, qrBankIds = ['963388'], qrSvg = fakeQrSvg(),
-  refuseImages = false, refuseSvg = false,
+  refuseImages = false, refuseBacked = false,
 } = {}) {
   const platform = await stubApi(updates);
   platform.refuseImages = refuseImages;
-  platform.refuseSvg = refuseSvg;
+  platform.refuseBacked = refuseBacked;
   const feedServer = await stubFeed(prices);
   const bankServer = await stubBanks(banks);
   const qrServer = await stubVietQr({ bankIds: qrBankIds, svg: qrSvg });
@@ -556,18 +557,33 @@ test('stripBotMention: bỏ cả username lẫn displayName', () => {
 
 // ---- vietqr: dựng mã ---------------------------------------------------------------------------
 
-test('parseQrSvg: lấy lưới module từ path, không lấy ảnh nền', () => {
+test('parseQrSvg: giữ cả nền lẫn lưới mã', () => {
   const parsed = parseQrSvg(fakeQrSvg());
   assert.equal(parsed.size, GRID);
   assert.equal(parsed.grid.length, GRID);
   assert.ok(parsed.grid[0][0], 'góc trên trái phải là module đen');
   assert.ok(parsed.grid.flat().some((v) => v), 'phải có module đen');
+  assert.equal(parsed.at.x, 92);
+  assert.equal(parsed.at.y, 94);
+  assert.match(parsed.background, /^data:image\/png;base64,/);
+  assert.deepEqual(parsed.backgroundSize, { width: 540, height: 640 });
 });
 
 test('parseQrSvg: không phải mã thì trả null', () => {
   assert.equal(parseQrSvg('<svg xmlns="http://www.w3.org/2000/svg"></svg>'), null);
   assert.equal(parseQrSvg('không phải svg'), null);
   assert.equal(parseQrSvg('<svg><g transform="translate(1 1) scale(2)"><rect width="4" height="4"/><path d="M0 0h1v1h-1z"/></g></svg>'), null);
+});
+
+test('composeQrSvg: khổ theo nền, có nền, không có transform, chữ không bị che', () => {
+  const svg = composeQrSvg(parseQrSvg(fakeQrSvg()));
+  assert.match(svg, /viewBox="0 0 540 640"/, 'khổ phải theo nền, không theo lưới mã');
+  assert.match(svg, /<image x="0" y="0" width="540" height="640" href="data:image\/png;base64,/);
+  assert.doesNotMatch(svg, /transform=/, 'không dùng transform');
+  // Không có ô trắng nào: nền đã chừa sẵn chỗ cho mã, thêm ô trắng là che mất dòng số tài khoản.
+  assert.doesNotMatch(svg, /<rect/);
+  // Một module đầu tiên phải nằm đúng chỗ path gốc vẽ nó.
+  assert.match(svg, /M92\.00 94\.00h/);
 });
 
 test('qrPng: ra PNG thật, đúng kích thước, và là RGBA', () => {
@@ -613,21 +629,41 @@ test('qrCaption: luôn có link khi được đưa', () => {
   assert.match(caption, /https:\/\/img\.vietqr\.io\/image\/x\.svg/);
 });
 
-test('fetchQr: dựng lại mã, SVG trước PNG sau', async () => {
+test('fetchQr: thử tấm nguyên bản của VietQR trước, rồi mới tới các bản dựng lại', async () => {
   const server = await stubVietQr();
   const account = { bankId: '963388', bankLabel: 'Timo', accountNo: '0905473034', name: 'NGUYEN TAN HIEU' };
   const card = await fetchQr(account, { amount: 100000, description: 'tra tien an' }, { image: server.image });
   assert.equal(card.status, 200);
-  assert.equal(card.images.length, 2, 'SVG và PNG, để thử lần lượt');
-  assert.equal(card.images[0].contentType, 'image/svg+xml');
-  assert.match(card.images[0].svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  assert.equal(card.images.length, 4, 'nguyên bản, tấm ghép, SVG trơ, PNG');
+  // 1. Nguyên bản: gửi nguyên thứ VietQR trả về, không đụng vào.
   assert.equal(card.images[0].fileName, 'vietqr-0905473034.svg');
-  assert.equal(card.images[1].contentType, 'image/png');
+  assert.match(card.images[0].svg, /^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  assert.match(card.images[0].svg, /<g transform="translate\(92 94\) scale\(6\.26/, 'nguyên bản còn nguyên transform');
+  // 2. Tấm ghép: cùng nội dung, bỏ transform, toạ độ tuyệt đối.
+  assert.equal(card.images[1].fileName, 'vietqr-0905473034-composed.svg');
+  assert.match(card.images[1].svg, /<image x="0" y="0" width="540" height="640" href="data:image\/png;base64,/);
+  assert.doesNotMatch(card.images[1].svg, /transform=/);
+  // 3. SVG trơ, 4. PNG.
+  assert.equal(card.images[2].fileName, 'vietqr-0905473034-qr.svg');
+  assert.equal(card.images[3].contentType, 'image/png');
   assert.equal(card.version, (GRID - 17) / 4);
-  const png = Buffer.from(card.images[1].dataBase64, 'base64');
+  const png = Buffer.from(card.images[3].dataBase64, 'base64');
   assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
   assert.match(server.asked[0], /amount=100000/);
   server.close();
+});
+
+test('fetchQr: SVG gốc của VietQR hợp lệ theo luật máy chủ', async () => {
+  // Nếu tấm nguyên bản vi phạm luật thì nó không nên đứng đầu danh sách thử.
+  const raw = [
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 640">',
+    '<image x="0" y="0" width="540" height="640" href="data:image/png;base64,AAAA"/>',
+    '<g transform="translate(92 94) scale(6.26)"><rect width="57" height="57" fill="#fff"/>',
+    '<path d="M0 0h7v1h-7z"/></g></svg>',
+  ].join('');
+  assert.match(raw, /<svg[\s>]/);
+  assert.doesNotMatch(raw, /<script|<foreignObject|\son\w+\s*=|href="https?:/i);
+  assert.ok(raw.length < 2_000_000, 'dưới hạn 2 MB');
 });
 
 test('fetchQr: ngân hàng sai thì không có ảnh, vẫn còn link', async () => {
@@ -739,15 +775,14 @@ test('gen-qr: số tiền đọc không ra thì nói thẳng', async () => {
   assert.match(sent[2].text, /Số tiền: để trống/);
 });
 
-test('gen-qr: máy chủ không chịu SVG thì PNG đi thay', async () => {
+test('gen-qr: máy chủ không chịu tấm nào có nền thì SVG trơ đi thay', async () => {
   const result = await withBot([
     update({ text: '@mathtanbot register timo 0905473034 hieu', from: { userId: 'u1' } }, 1),
     update({ text: '@mathtanbot gen-qr 100k tra tien', from: { userId: 'u1' } }, 2),
-  ], { expect: 2, settle: 500, refuseSvg: true });
-  assert.equal(result.sent.length, 2, 'tin SVG bị từ chối, PNG đi thay');
-  assert.equal(result.sent[1].image.contentType, 'image/png');
-  const png = Buffer.from(result.sent[1].image.dataBase64, 'base64');
-  assert.deepEqual([...png.subarray(0, 8)], [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  ], { expect: 2, settle: 500, refuseBacked: true });
+  assert.equal(result.sent.length, 2, 'hai tấm có nền bị từ chối, SVG trơ đi thay');
+  assert.equal(result.sent[1].image.fileName, 'vietqr-0905473034-qr.svg');
+  assert.doesNotMatch(result.sent[1].image.svg, /<image /);
   assert.match(result.sent[1].text, /Số tiền: 100\.000đ/);
 });
 

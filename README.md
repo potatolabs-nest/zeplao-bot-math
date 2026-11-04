@@ -56,12 +56,22 @@ dựng, người chuyển tự nhập.
 có cách nào đọc mã QR ai đó gửi lên. Đổi lại, `register` trả về ngay mã của tài khoản vừa lưu.
 
 Mã QR lấy từ [Quick Link của VietQR](https://www.vietqr.io/qr-dong) — một URL, không cần khoá.
-VietQR trả về SVG, nhưng mã trong đó là **hình vector** nằm đè lên một tấm ảnh nền có logo ngân hàng;
-`parseQrSvg` dựng lại lưới module từ chính hình ấy, rồi `qrSvg` vẽ lại thành SVG sạch và `qrPng`
-thành PNG. Bóc tấm ảnh nền ra thì người nhận chỉ thấy cái khung.
+VietQR trả về SVG gồm hai phần:
 
-Bot gửi SVG trước, PNG sau, rồi mới tới chữ không ảnh — máy chủ từ chối kiểu nào thì kiểu kế tiếp đi
-thay. Chữ của tin có ảnh đi kèm dưới dạng `rich`, không phải `text` trần.
+- một `<image>` phủ kín khung — nền, có logo ngân hàng, tên chủ tài khoản, số tiền, nội dung
+- một `<path>` vẽ từng module của mã, nằm trong `<g transform>`
+
+Tấm nguyên bản hợp lệ theo đúng luật máy chủ ghi (có thẻ `svg`, không script, không foreignObject,
+không handler, không link ngoài), nên nó được gửi **trước tiên**. Ba bản sau chỉ để câu trả lời
+không mất hình khi tấm ấy bị từ chối, hoặc bị nhận mà bộ lọc của máy chủ bỏ mất `<g transform>`:
+
+1. nguyên bản của VietQR
+2. `composeQrSvg` — đúng nội dung ấy, vẽ lại bằng toạ độ tuyệt đối, không `transform`, và để nguyên
+   khoảng trống mà nền đã chừa sẵn cho mã (không vẽ ô trắng, vì ô trắng sẽ che dòng số tài khoản)
+3. `qrSvg` — chỉ mã, không nền
+4. `qrPng` — PNG RGBA
+
+Cuối cùng mới tới chữ không ảnh. Chữ của tin có ảnh đi kèm dưới dạng `rich`, không phải `text` trần.
 
 ## Chạy
 

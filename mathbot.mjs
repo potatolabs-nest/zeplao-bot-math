@@ -616,26 +616,33 @@ export function qrLink(account, { amount = null, description = '' } = {}, { imag
 }
 
 /**
- * QR trong câu trả lời của VietQR là hình vector, không nằm trong tấm ảnh nền.
+ * Tấm SVG của VietQR gồm hai phần, và chúng phải được giữ **cả hai**.
  *
- * Tấm SVG gồm đúng hai thứ dễ nhầm với nhau: một `<image>` phủ kín khung — ấy là **nền**, có logo
- * ngân hàng và không có mã nào — và một `<g transform="translate(x y) scale(s)">` chứa ô trắng cùng
- * một `<path>` vẽ từng module của mã. Bóc tấm nền ra gửi đi thì người nhận thấy đúng khung, đúng
- * logo, và một khoảng trắng ở giữa.
+ * Phần thứ nhất là một `<image>` phủ kín khung — ấy là nền: khung, logo ngân hàng, tên chủ tài
+ * khoản, số tiền, nội dung. Phần thứ hai là một `<g transform="translate(x y) scale(s)">` chứa ô
+ * trắng cùng một `<path>` vẽ từng module của mã.
  *
- * Nên mã phải dựng lại từ chính path ấy: mỗi lệnh `M<x> <y>h<w>v1h-<w>z` là một dải module đen
- * nằm ngang, cộng lại thành lưới ô vuông, rồi vẽ lưới thành PNG.
+ * Tấm nguyên bản hợp lệ theo đúng luật máy chủ ghi, nên nó được gửi trước (`fetchQr`). Hàm này chỉ
+ * dựng bản thay thế cho trường hợp tấm ấy bị từ chối, hoặc bị nhận mà bộ lọc của máy chủ bỏ mất
+ * `<g transform>` khiến mã nằm sai chỗ.
+ *
+ * Bóc tấm nền ra thì người nhận thấy khung với logo mà giữa trống; bóc hình vector ra thì thấy mã
+ * trơ, mất hết thông tin chuyển khoản. Nên ở đây bóc **cả hai**, rồi `composeQrSvg` ghép lại.
  */
 export function parseQrSvg(svg) {
   const group = /<g\b[^>]*transform="translate\(\s*([\d.]+)[\s,]+([\d.]+)\s*\)\s*scale\(\s*([\d.]+)\s*\)"[^>]*>([\s\S]*?)<\/g>/.exec(svg);
   if (!group) return null;
+  const translateX = Number(group[1]);
+  const translateY = Number(group[2]);
+  const scale = Number(group[3]);
   const inner = group[4];
-  const box = /<rect\b[^>]*width="(\d+)"[^>]*height="(\d+)"/.exec(inner);
+  const box = /<rect\b[^>]*width="([\d.]+)"[^>]*height="([\d.]+)"/.exec(inner);
   const path = /<path\b[^>]*\bd="([^"]*)"/.exec(inner);
   if (!box || !path) return null;
 
   const size = Number(box[1]);
   if (Number(box[2]) !== size || !Number.isInteger(size) || size < 9 || size > 200) return null;
+  if (!Number.isFinite(translateX) || !Number.isFinite(translateY) || !(scale > 0)) return null;
 
   const grid = Array.from({ length: size }, () => new Uint8Array(size));
   let runs = 0;
@@ -647,7 +654,24 @@ export function parseQrSvg(svg) {
   }
   if (runs < 50) return null;
 
-  return { size, grid, version: (size - 17) / 4 };
+  // Nền là ảnh đầu tiên; bỏ nó đi thì tấm card mất khung, mất logo, mất tên. Kích thước của nó
+  // cũng chính là khổ tấm card, nên phải lấy theo nó chứ không theo lưới mã — lưới chỉ là một phần
+  // nằm trong ấy.
+  const image = /<image\b([^>]*)\bhref="(data:image\/[\w+.-]+;base64,[^"]+)"([^>]*)>/.exec(svg);
+  const sizeOf = (attrs, name) => Number(new RegExp(`\\b${name}="([\\d.]+)"`).exec(attrs)?.[1]);
+
+  return {
+    size,
+    grid,
+    version: (size - 17) / 4,
+    quiet: 4,
+    at: { x: translateX, y: translateY },
+    scale,
+    background: image ? image[2] : null,
+    backgroundSize: image
+      ? { width: sizeOf(image[1] + image[3], 'width'), height: sizeOf(image[1] + image[3], 'height') }
+      : null,
+  };
 }
 
 function crc32(bytes) {
@@ -709,14 +733,49 @@ export function qrPng(grid, { scale = 8, quiet = 4 } = {}) {
 }
 
 /**
- * Cùng lưới ấy, vẽ thành SVG sạch.
+ * Ghép nền của VietQR với lưới mã thành một tấm SVG sạch.
  *
- * Nền tảng nhận hai kiểu ảnh, và kiểu SVG là kiểu đã có bằng chứng chạy được: bot chứng khoán trong
- * nhóm gửi chart bằng SVG suốt, còn PNG thì chưa ai xác nhận. Nên đây là đường lùi khi tấm PNG bị
- * từ chối — không phải suy đoán, mà là kiểu ảnh duy nhất biết chắc là hiện.
+ * Lưới được vẽ thẳng bằng toạ độ tuyệt đối, không dùng `<g transform>`: transform là thứ duy nhất
+ * có mặt trong tấm SVG gốc mà tấm dựng lại không có, nên nó là nghi phạm đầu tiên cho việc mã không
+ * hiện. Bỏ nó đi thì không còn gì để đoán.
+ */
+export function composeQrSvg(parsed) {
+  const { size, grid, scale, at, background, backgroundSize } = parsed;
+  const pad = parsed.quiet * scale;
+  // Khổ tấm card lấy theo nền, không theo lưới mã: nền mới là cả tấm, mã chỉ nằm trong ấy.
+  const width = backgroundSize?.width || pad * 2 + size * scale;
+  const height = backgroundSize?.height || pad * 2 + size * scale;
+
+  const runs = [];
+  for (let y = 0; y < size; y++) {
+    let x = 0;
+    while (x < size) {
+      if (!grid[y][x]) { x++; continue; }
+      let width_ = 1;
+      while (x + width_ < size && grid[y][x + width_]) width_++;
+      const span = (width_ * scale).toFixed(2);
+      const px = (at.x + x * scale).toFixed(2);
+      const py = (at.y + y * scale).toFixed(2);
+      runs.push(`M${px} ${py}h${span}v${scale}h-${span}z`);
+      x += width_;
+    }
+  }
+
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + width + ' ' + height + '"'
+    + ' width="' + width + '" height="' + height + '" shape-rendering="crispEdges">'
+    + (background ? `<image x="0" y="0" width="${width}" height="${height}" href="${background}"/>` : '')
+    // Không có ô trắng nào dưới mã.
+    //
+    // Nền đã chừa sẵn đúng khoảng trống ấy — mã khớp khít vào đó, không đè lên header, số tài khoản
+    // hay tên. Thêm một ô trắng chỉ để che mất dòng "Số tài khoản" mà nền vốn đã vẽ.
+    + '<path fill="#000000" d="' + runs.join('') + '"/></svg>';
+}
+
+/**
+ * Cùng lưới ấy, vẽ thành SVG trơ — chỉ mã, không nền.
  *
- * "Sạch" ở đây đúng theo nghĩa máy chủ kiểm: chỉ `svg`, `rect`, `path`; không script, không
- * foreignObject, không handler, không link ngoài.
+ * Đường lùi cuối: tấm ghép bị từ chối vì tấm nền thì tấm này vẫn còn. Mất khung lẫn logo, nhưng vẫn
+ * quét được.
  */
 export function qrSvg(grid) {
   const size = grid.length;
@@ -766,12 +825,20 @@ export async function fetchQr(account, { amount = null, description = '' } = {},
   if (!parsed) return { link, images: [], status: response.status, reason: 'unreadable_qr' };
 
   const name = `vietqr-${account.accountNo}`;
-  // SVG đứng trước, PNG đứng sau.
+  // Bốn ứng viên, thử lần lượt cho tới khi một cái đi được.
   //
-  // Không phải vì SVG đẹp hơn — vì nó là kiểu duy nhất có bằng chứng chạy được trên nền tảng này:
-  // bot chứng khoán trong nhóm gửi chart bằng SVG và hình hiện, còn tấm PNG gửi thử thì máy chủ
-  // nhận, lưu thành tệp, rồi không vẽ ra hình. PNG ở lại làm đường lùi.
-  const images = [{ fileName: `${name}.svg`, contentType: 'image/svg+xml', svg: qrSvg(parsed.grid) }];
+  // 1. Tấm nguyên bản của VietQR. Chưa từng thử gửi lần nào, nhưng nó hợp lệ theo đúng luật máy chủ
+  //    ghi: có thẻ `svg`, không script, không foreignObject, không handler, không link ngoài (mọi
+  //    `href` đều là `data:`). Nếu máy chủ nhận thì đây là tấm đẹp nhất — không có gì phải dựng lại.
+  // 2. Tấm ghép: đúng nội dung ấy, vẽ lại bằng toạ độ tuyệt đối, không `transform`. Dành cho trường
+  //    hợp máy chủ nhận tấm 1 nhưng bộ lọc của nó bỏ `<g transform>` — khi ấy mã sẽ nằm sai chỗ.
+  // 3. SVG trơ: chỉ mã, không nền.
+  // 4. PNG.
+  const images = [
+    { fileName: `${name}.svg`, contentType: 'image/svg+xml', svg: body },
+    { fileName: `${name}-composed.svg`, contentType: 'image/svg+xml', svg: composeQrSvg(parsed) },
+    { fileName: `${name}-qr.svg`, contentType: 'image/svg+xml', svg: qrSvg(parsed.grid) },
+  ];
   const png = qrPng(parsed.grid);
   if (png.length <= MOST_IMAGE_BYTES) {
     images.push({ fileName: `${name}.png`, contentType: 'image/png', dataBase64: png.toString('base64') });
